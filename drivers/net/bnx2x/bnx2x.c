@@ -22,7 +22,6 @@
 #include "ecore_init_ops.h"
 
 #include "rte_version.h"
-#include "rte_pci_dev_ids.h"
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -32,18 +31,20 @@
 #define BNX2X_PMD_VER_PREFIX "BNX2X PMD"
 #define BNX2X_PMD_VERSION_MAJOR 1
 #define BNX2X_PMD_VERSION_MINOR 0
-#define BNX2X_PMD_VERSION_PATCH 0
+#define BNX2X_PMD_VERSION_REVISION 1
+#define BNX2X_PMD_VERSION_PATCH 1
 
 static inline const char *
 bnx2x_pmd_version(void)
 {
 	static char version[32];
 
-	snprintf(version, sizeof(version), "%s %s_%d.%d.%d",
+	snprintf(version, sizeof(version), "%s %s_%d.%d.%d.%d",
 			BNX2X_PMD_VER_PREFIX,
 			BNX2X_DRIVER_VERSION,
 			BNX2X_PMD_VERSION_MAJOR,
 			BNX2X_PMD_VERSION_MINOR,
+			BNX2X_PMD_VERSION_REVISION,
 			BNX2X_PMD_VERSION_PATCH);
 
 	return version;
@@ -292,13 +293,13 @@ void bnx2x_post_dmae(struct bnx2x_softc *sc, struct dmae_command *dmae, int idx)
 
 uint32_t bnx2x_dmae_opcode_add_comp(uint32_t opcode, uint8_t comp_type)
 {
-	return (opcode | ((comp_type << DMAE_COMMAND_C_DST_SHIFT) |
-			  DMAE_COMMAND_C_TYPE_ENABLE));
+	return opcode | ((comp_type << DMAE_COMMAND_C_DST_SHIFT) |
+			  DMAE_COMMAND_C_TYPE_ENABLE);
 }
 
 uint32_t bnx2x_dmae_opcode_clr_src_reset(uint32_t opcode)
 {
-	return (opcode & ~DMAE_COMMAND_SRC_RESET);
+	return opcode & ~DMAE_COMMAND_SRC_RESET;
 }
 
 uint32_t
@@ -1098,7 +1099,7 @@ static int bnx2x_tx_queue_has_work(const struct bnx2x_fastpath *fp)
 
 	mb();			/* status block fields can change */
 	hw_cons = le16toh(*fp->tx_cons_sb);
-	return (hw_cons != txq->tx_pkt_head);
+	return hw_cons != txq->tx_pkt_head;
 }
 
 static uint8_t bnx2x_has_tx_work(struct bnx2x_fastpath *fp)
@@ -1122,7 +1123,7 @@ static int bnx2x_has_rx_work(struct bnx2x_fastpath *fp)
 	if (unlikely((rx_cq_cons_sb & MAX_RCQ_ENTRIES(rxq)) ==
 		     MAX_RCQ_ENTRIES(rxq)))
 		rx_cq_cons_sb++;
-	return (rxq->rx_cq_head != rx_cq_cons_sb);
+	return rxq->rx_cq_head != rx_cq_cons_sb;
 }
 
 static void
@@ -1280,7 +1281,7 @@ next_cqe:
 	/* Update producers */
 	bnx2x_update_rx_prod(sc, fp, bd_prod_fw, sw_cq_prod);
 
-	return (sw_cq_cons != hw_cq_cons);
+	return sw_cq_cons != hw_cq_cons;
 }
 
 static uint16_t
@@ -1293,7 +1294,7 @@ bnx2x_free_tx_pkt(__rte_unused struct bnx2x_fastpath *fp, struct bnx2x_tx_queue 
 	struct rte_mbuf *tx_mbuf = txq->sw_ring[TX_BD(pkt_idx, txq)];
 
 	if (likely(tx_mbuf != NULL)) {
-		rte_pktmbuf_free(tx_mbuf);
+		rte_pktmbuf_free_seg(tx_mbuf);
 	} else {
 		PMD_RX_LOG(ERR, "fp[%02d] lost mbuf %lu",
 			   fp->index, (unsigned long)TX_BD(pkt_idx, txq));
@@ -2113,147 +2114,127 @@ bnx2x_nic_unload(struct bnx2x_softc *sc, uint32_t unload_mode, uint8_t keep_link
  * the mbuf and return to the caller.
  *
  * Returns:
- *   0 = Success, !0 = Failure
+ *     int: Number of TX BDs used for the mbuf
+ *
  *   Note the side effect that an mbuf may be freed if it causes a problem.
  */
-int bnx2x_tx_encap(struct bnx2x_tx_queue *txq, struct rte_mbuf **m_head, int m_pkts)
+int bnx2x_tx_encap(struct bnx2x_tx_queue *txq, struct rte_mbuf *m0)
 {
-	struct rte_mbuf *m0;
 	struct eth_tx_start_bd *tx_start_bd;
 	uint16_t bd_prod, pkt_prod;
-	int m_tx;
 	struct bnx2x_softc *sc;
 	uint32_t nbds = 0;
-	struct bnx2x_fastpath *fp;
 
 	sc = txq->sc;
-	fp = &sc->fp[txq->queue_id];
-
 	bd_prod = txq->tx_bd_tail;
 	pkt_prod = txq->tx_pkt_tail;
 
-	for (m_tx = 0; m_tx < m_pkts; m_tx++) {
+	txq->sw_ring[TX_BD(pkt_prod, txq)] = m0;
 
-		m0 = *m_head++;
+	tx_start_bd = &txq->tx_ring[TX_BD(bd_prod, txq)].start_bd;
 
-		if (unlikely(txq->nb_tx_avail < 3)) {
-			PMD_TX_LOG(ERR, "no enough bds %d/%d",
-				   bd_prod, txq->nb_tx_avail);
-			return -ENOMEM;
-		}
+	tx_start_bd->addr =
+	    rte_cpu_to_le_64(rte_mbuf_data_dma_addr(m0));
+	tx_start_bd->nbytes = rte_cpu_to_le_16(m0->data_len);
+	tx_start_bd->bd_flags.as_bitfield = ETH_TX_BD_FLAGS_START_BD;
+	tx_start_bd->general_data =
+	    (1 << ETH_TX_START_BD_HDR_NBDS_SHIFT);
 
-		txq->sw_ring[TX_BD(pkt_prod, txq)] = m0;
+	tx_start_bd->nbd = rte_cpu_to_le_16(2);
 
-		tx_start_bd = &txq->tx_ring[TX_BD(bd_prod, txq)].start_bd;
-
-		tx_start_bd->addr =
-		    rte_cpu_to_le_64(RTE_MBUF_DATA_DMA_ADDR(m0));
-		tx_start_bd->nbytes = rte_cpu_to_le_16(m0->data_len);
-		tx_start_bd->bd_flags.as_bitfield = ETH_TX_BD_FLAGS_START_BD;
-		tx_start_bd->general_data =
-		    (1 << ETH_TX_START_BD_HDR_NBDS_SHIFT);
-
-		tx_start_bd->nbd = rte_cpu_to_le_16(2);
-
-		if (m0->ol_flags & PKT_TX_VLAN_PKT) {
+	if (m0->ol_flags & PKT_TX_VLAN_PKT) {
+		tx_start_bd->vlan_or_ethertype =
+		    rte_cpu_to_le_16(m0->vlan_tci);
+		tx_start_bd->bd_flags.as_bitfield |=
+		    (X_ETH_OUTBAND_VLAN <<
+		     ETH_TX_BD_FLAGS_VLAN_MODE_SHIFT);
+	} else {
+		if (IS_PF(sc))
 			tx_start_bd->vlan_or_ethertype =
-			    rte_cpu_to_le_16(m0->vlan_tci);
-			tx_start_bd->bd_flags.as_bitfield |=
-			    (X_ETH_OUTBAND_VLAN <<
-			     ETH_TX_BD_FLAGS_VLAN_MODE_SHIFT);
-		} else {
-			if (IS_PF(sc))
-				tx_start_bd->vlan_or_ethertype =
-				    rte_cpu_to_le_16(pkt_prod);
-			else {
-				struct ether_hdr *eh
-				    = rte_pktmbuf_mtod(m0, struct ether_hdr *);
+			    rte_cpu_to_le_16(pkt_prod);
+		else {
+			struct ether_hdr *eh =
+			    rte_pktmbuf_mtod(m0, struct ether_hdr *);
 
-				tx_start_bd->vlan_or_ethertype
-				    = rte_cpu_to_le_16(rte_be_to_cpu_16(eh->ether_type));
-			}
-		}
-
-		bd_prod = NEXT_TX_BD(bd_prod);
-		if (IS_VF(sc)) {
-			struct eth_tx_parse_bd_e2 *tx_parse_bd;
-			const struct ether_hdr *eh = rte_pktmbuf_mtod(m0, struct ether_hdr *);
-			uint8_t mac_type = UNICAST_ADDRESS;
-
-			tx_parse_bd =
-			    &txq->tx_ring[TX_BD(bd_prod, txq)].parse_bd_e2;
-			if (is_multicast_ether_addr(&eh->d_addr)) {
-				if (is_broadcast_ether_addr(&eh->d_addr))
-					mac_type = BROADCAST_ADDRESS;
-				else
-					mac_type = MULTICAST_ADDRESS;
-			}
-			tx_parse_bd->parsing_data =
-			    (mac_type << ETH_TX_PARSE_BD_E2_ETH_ADDR_TYPE_SHIFT);
-
-			rte_memcpy(&tx_parse_bd->data.mac_addr.dst_hi,
-				   &eh->d_addr.addr_bytes[0], 2);
-			rte_memcpy(&tx_parse_bd->data.mac_addr.dst_mid,
-				   &eh->d_addr.addr_bytes[2], 2);
-			rte_memcpy(&tx_parse_bd->data.mac_addr.dst_lo,
-				   &eh->d_addr.addr_bytes[4], 2);
-			rte_memcpy(&tx_parse_bd->data.mac_addr.src_hi,
-				   &eh->s_addr.addr_bytes[0], 2);
-			rte_memcpy(&tx_parse_bd->data.mac_addr.src_mid,
-				   &eh->s_addr.addr_bytes[2], 2);
-			rte_memcpy(&tx_parse_bd->data.mac_addr.src_lo,
-				   &eh->s_addr.addr_bytes[4], 2);
-
-			tx_parse_bd->data.mac_addr.dst_hi =
-			    rte_cpu_to_be_16(tx_parse_bd->data.mac_addr.dst_hi);
-			tx_parse_bd->data.mac_addr.dst_mid =
-			    rte_cpu_to_be_16(tx_parse_bd->data.
-					     mac_addr.dst_mid);
-			tx_parse_bd->data.mac_addr.dst_lo =
-			    rte_cpu_to_be_16(tx_parse_bd->data.mac_addr.dst_lo);
-			tx_parse_bd->data.mac_addr.src_hi =
-			    rte_cpu_to_be_16(tx_parse_bd->data.mac_addr.src_hi);
-			tx_parse_bd->data.mac_addr.src_mid =
-			    rte_cpu_to_be_16(tx_parse_bd->data.
-					     mac_addr.src_mid);
-			tx_parse_bd->data.mac_addr.src_lo =
-			    rte_cpu_to_be_16(tx_parse_bd->data.mac_addr.src_lo);
-
-			PMD_TX_LOG(DEBUG,
-				   "PBD dst %x %x %x src %x %x %x p_data %x",
-				   tx_parse_bd->data.mac_addr.dst_hi,
-				   tx_parse_bd->data.mac_addr.dst_mid,
-				   tx_parse_bd->data.mac_addr.dst_lo,
-				   tx_parse_bd->data.mac_addr.src_hi,
-				   tx_parse_bd->data.mac_addr.src_mid,
-				   tx_parse_bd->data.mac_addr.src_lo,
-				   tx_parse_bd->parsing_data);
-		}
-
-		PMD_TX_LOG(DEBUG,
-			   "start bd: nbytes %d flags %x vlan %x\n",
-			   tx_start_bd->nbytes,
-			   tx_start_bd->bd_flags.as_bitfield,
-			   tx_start_bd->vlan_or_ethertype);
-
-		bd_prod = NEXT_TX_BD(bd_prod);
-		pkt_prod++;
-
-		if (TX_IDX(bd_prod) < 2) {
-			nbds++;
+			tx_start_bd->vlan_or_ethertype =
+			    rte_cpu_to_le_16(rte_be_to_cpu_16(eh->ether_type));
 		}
 	}
 
-	txq->nb_tx_avail -= m_pkts << 1;
+	bd_prod = NEXT_TX_BD(bd_prod);
+	if (IS_VF(sc)) {
+		struct eth_tx_parse_bd_e2 *tx_parse_bd;
+		const struct ether_hdr *eh =
+		    rte_pktmbuf_mtod(m0, struct ether_hdr *);
+		uint8_t mac_type = UNICAST_ADDRESS;
+
+		tx_parse_bd =
+		    &txq->tx_ring[TX_BD(bd_prod, txq)].parse_bd_e2;
+		if (is_multicast_ether_addr(&eh->d_addr)) {
+			if (is_broadcast_ether_addr(&eh->d_addr))
+				mac_type = BROADCAST_ADDRESS;
+			else
+				mac_type = MULTICAST_ADDRESS;
+		}
+		tx_parse_bd->parsing_data =
+		    (mac_type << ETH_TX_PARSE_BD_E2_ETH_ADDR_TYPE_SHIFT);
+
+		rte_memcpy(&tx_parse_bd->data.mac_addr.dst_hi,
+			   &eh->d_addr.addr_bytes[0], 2);
+		rte_memcpy(&tx_parse_bd->data.mac_addr.dst_mid,
+			   &eh->d_addr.addr_bytes[2], 2);
+		rte_memcpy(&tx_parse_bd->data.mac_addr.dst_lo,
+			   &eh->d_addr.addr_bytes[4], 2);
+		rte_memcpy(&tx_parse_bd->data.mac_addr.src_hi,
+			   &eh->s_addr.addr_bytes[0], 2);
+		rte_memcpy(&tx_parse_bd->data.mac_addr.src_mid,
+			   &eh->s_addr.addr_bytes[2], 2);
+		rte_memcpy(&tx_parse_bd->data.mac_addr.src_lo,
+			   &eh->s_addr.addr_bytes[4], 2);
+
+		tx_parse_bd->data.mac_addr.dst_hi =
+		    rte_cpu_to_be_16(tx_parse_bd->data.mac_addr.dst_hi);
+		tx_parse_bd->data.mac_addr.dst_mid =
+		    rte_cpu_to_be_16(tx_parse_bd->data.
+				     mac_addr.dst_mid);
+		tx_parse_bd->data.mac_addr.dst_lo =
+		    rte_cpu_to_be_16(tx_parse_bd->data.mac_addr.dst_lo);
+		tx_parse_bd->data.mac_addr.src_hi =
+		    rte_cpu_to_be_16(tx_parse_bd->data.mac_addr.src_hi);
+		tx_parse_bd->data.mac_addr.src_mid =
+		    rte_cpu_to_be_16(tx_parse_bd->data.
+				     mac_addr.src_mid);
+		tx_parse_bd->data.mac_addr.src_lo =
+		    rte_cpu_to_be_16(tx_parse_bd->data.mac_addr.src_lo);
+
+		PMD_TX_LOG(DEBUG,
+			   "PBD dst %x %x %x src %x %x %x p_data %x",
+			   tx_parse_bd->data.mac_addr.dst_hi,
+			   tx_parse_bd->data.mac_addr.dst_mid,
+			   tx_parse_bd->data.mac_addr.dst_lo,
+			   tx_parse_bd->data.mac_addr.src_hi,
+			   tx_parse_bd->data.mac_addr.src_mid,
+			   tx_parse_bd->data.mac_addr.src_lo,
+			   tx_parse_bd->parsing_data);
+	}
+
+	PMD_TX_LOG(DEBUG,
+		   "start bd: nbytes %d flags %x vlan %x\n",
+		   tx_start_bd->nbytes,
+		   tx_start_bd->bd_flags.as_bitfield,
+		   tx_start_bd->vlan_or_ethertype);
+
+	bd_prod = NEXT_TX_BD(bd_prod);
+	pkt_prod++;
+
+	if (TX_IDX(bd_prod) < 2)
+		nbds++;
+
+	txq->nb_tx_avail -= 2;
 	txq->tx_bd_tail = bd_prod;
 	txq->tx_pkt_tail = pkt_prod;
 
-	mb();
-	fp->tx_db.data.prod += (m_pkts << 1) + nbds;
-	DOORBELL(sc, txq->queue_id, fp->tx_db.raw);
-	mb();
-
-	return 0;
+	return nbds + 2;
 }
 
 static uint16_t bnx2x_cid_ilt_lines(struct bnx2x_softc *sc)
@@ -2331,15 +2312,6 @@ static void bnx2x_set_fp_rx_buf_size(struct bnx2x_softc *sc)
 		/* get the Rx buffer size for RX frames */
 		sc->fp[i].rx_buf_size =
 		    (IP_HEADER_ALIGNMENT_PADDING + ETH_OVERHEAD + sc->mtu);
-
-		/* get the mbuf allocation size for RX frames */
-		if (sc->fp[i].rx_buf_size <= MCLBYTES) {
-			sc->fp[i].mbuf_alloc_size = MCLBYTES;
-		} else if (sc->fp[i].rx_buf_size <= BNX2X_PAGE_SIZE) {
-			sc->fp[i].mbuf_alloc_size = PAGE_SIZE;
-		} else {
-			sc->fp[i].mbuf_alloc_size = MJUM9BYTES;
-		}
 	}
 }
 
@@ -2559,7 +2531,7 @@ static void bnx2x_clear_reset_global(struct bnx2x_softc *sc)
 /* checks the GLOBAL_RESET bit, should be run under rtnl lock */
 static uint8_t bnx2x_reset_is_global(struct bnx2x_softc *sc)
 {
-	return (REG_RD(sc, BNX2X_RECOVERY_GLOB_REG) & BNX2X_GLOBAL_RESET_BIT);
+	return REG_RD(sc, BNX2X_RECOVERY_GLOB_REG) & BNX2X_GLOBAL_RESET_BIT;
 }
 
 /* clear RESET_IN_PROGRESS bit for the engine, should be run under rtnl lock */
@@ -2618,7 +2590,7 @@ static uint8_t bnx2x_get_load_status(struct bnx2x_softc *sc, int engine)
 
 	val = ((val & mask) >> shift);
 
-	return (val != 0);
+	return val != 0;
 }
 
 /* set pf load mark */
@@ -4535,7 +4507,7 @@ static void bnx2x_handle_fp_tq(struct bnx2x_fastpath *fp, int scan_fp)
 	}
 
 	bnx2x_ack_sb(sc, fp->igu_sb_id, USTORM_ID,
-		   le16toh(fp->fp_hc_idx), IGU_INT_ENABLE, 1);
+		   le16toh(fp->fp_hc_idx), IGU_INT_DISABLE, 1);
 }
 
 /*
@@ -4860,9 +4832,9 @@ bnx2x_init_sb(struct bnx2x_softc *sc, phys_addr_t busaddr, int vfid,
 static uint8_t bnx2x_fp_qzone_id(struct bnx2x_fastpath *fp)
 {
 	if (CHIP_IS_E1x(fp->sc)) {
-		return (fp->cl_id + SC_PORT(fp->sc) * ETH_MAX_RX_CLIENTS_E1H);
+		return fp->cl_id + SC_PORT(fp->sc) * ETH_MAX_RX_CLIENTS_E1H;
 	} else {
-		return (fp->cl_id);
+		return fp->cl_id;
 	}
 }
 
@@ -4872,9 +4844,9 @@ bnx2x_rx_ustorm_prods_offset(struct bnx2x_softc *sc, struct bnx2x_fastpath *fp)
 	uint32_t offset = BAR_USTRORM_INTMEM;
 
 	if (IS_VF(sc)) {
-		return (PXP_VF_ADDR_USDM_QUEUES_START +
+		return PXP_VF_ADDR_USDM_QUEUES_START +
 			(sc->acquire_resp.resc.hw_qid[fp->index] *
-			 sizeof(struct ustorm_queue_zone_data)));
+			 sizeof(struct ustorm_queue_zone_data));
 	} else if (!CHIP_IS_E1x(sc)) {
 		offset += USTORM_RX_PRODS_E2_OFFSET(fp->cl_qzone_id);
 	} else {
@@ -7587,8 +7559,8 @@ static uint32_t bnx2x_pcie_capability_read(struct bnx2x_softc *sc, int reg)
 
 static uint8_t bnx2x_is_pcie_pending(struct bnx2x_softc *sc)
 {
-	return (bnx2x_pcie_capability_read(sc, PCIR_EXPRESS_DEVICE_STA) &
-		PCIM_EXP_STA_TRANSACTION_PND);
+	return bnx2x_pcie_capability_read(sc, PCIR_EXPRESS_DEVICE_STA) &
+		PCIM_EXP_STA_TRANSACTION_PND;
 }
 
 /*
@@ -8914,7 +8886,7 @@ int bnx2x_alloc_hsi_mem(struct bnx2x_softc *sc)
 /***************************/
 
 		if (bnx2x_dma_alloc(sc, FW_BUF_SIZE, &sc->gz_buf_dma,
-				  "fw_dec_buf", RTE_CACHE_LINE_SIZE) != 0) {
+				  "fw_buf", RTE_CACHE_LINE_SIZE) != 0) {
 			sc->spq = NULL;
 			sc->sp = NULL;
 			sc->eq = NULL;
@@ -9578,8 +9550,15 @@ static int bnx2x_pci_get_caps(struct bnx2x_softc *sc)
 
 static void bnx2x_init_rte(struct bnx2x_softc *sc)
 {
-	sc->max_tx_queues = 128;
-	sc->max_rx_queues = 128;
+	if (IS_VF(sc)) {
+		sc->max_tx_queues = min(BNX2X_VF_MAX_QUEUES_PER_VF,
+					sc->igu_sb_cnt);
+		sc->max_rx_queues = min(BNX2X_VF_MAX_QUEUES_PER_VF,
+					sc->igu_sb_cnt);
+	} else {
+		sc->max_tx_queues = 128;
+		sc->max_rx_queues = 128;
+	}
 }
 
 #define FW_HEADER_LEN 104
@@ -9592,7 +9571,7 @@ void bnx2x_load_firmware(struct bnx2x_softc *sc)
 	int f;
 	struct stat st;
 
-	fwname = sc->devinfo.device_id == BNX2X_DEV_ID_57711
+	fwname = sc->devinfo.device_id == CHIP_NUM_57711
 		? FW_NAME_57711 : FW_NAME_57810;
 	f = open(fwname, O_RDONLY);
 	if (f < 0) {
@@ -9702,9 +9681,6 @@ int bnx2x_attach(struct bnx2x_softc *sc)
 
 	sc->state = BNX2X_STATE_CLOSED;
 
-	/* Init RTE stuff */
-	bnx2x_init_rte(sc);
-
 	pci_write_long(sc, PCICFG_GRC_ADDRESS, PCICFG_VENDOR_ID_OFFSET);
 
 	sc->igu_base_addr = IS_VF(sc) ? PXP_VF_ADDR_IGU_START : BAR_IGU_INTMEM;
@@ -9717,10 +9693,13 @@ int bnx2x_attach(struct bnx2x_softc *sc)
 		pci_read(sc,
 			 (sc->devinfo.pcie_msix_cap_reg + PCIR_MSIX_CTRL), &val,
 			 2);
-		sc->igu_sb_cnt = (val & PCIM_MSIXCTRL_TABLE_SIZE);
+		sc->igu_sb_cnt = (val & PCIM_MSIXCTRL_TABLE_SIZE) + 1;
 	} else {
 		sc->igu_sb_cnt = 1;
 	}
+
+	/* Init RTE stuff */
+	bnx2x_init_rte(sc);
 
 	if (IS_PF(sc)) {
 /* get device info and set params */
@@ -9922,7 +9901,7 @@ static uint32_t bnx2x_get_pretend_reg(struct bnx2x_softc *sc)
 {
 	uint32_t base = PXP2_REG_PGL_PRETEND_FUNC_F0;
 	uint32_t stride = (PXP2_REG_PGL_PRETEND_FUNC_F1 - base);
-	return (base + (SC_ABS_FUNC(sc)) * stride);
+	return base + (SC_ABS_FUNC(sc)) * stride;
 }
 
 /*
@@ -10777,11 +10756,11 @@ static uint32_t bnx2x_flr_clnup_poll_count(struct bnx2x_softc *sc)
 {
 	/* adjust polling timeout */
 	if (CHIP_REV_IS_EMUL(sc)) {
-		return (FLR_POLL_CNT * 2000);
+		return FLR_POLL_CNT * 2000;
 	}
 
 	if (CHIP_REV_IS_FPGA(sc)) {
-		return (FLR_POLL_CNT * 120);
+		return FLR_POLL_CNT * 120;
 	}
 
 	return FLR_POLL_CNT;

@@ -53,8 +53,6 @@
 #include <unistd.h>
 #include <poll.h>
 
-#include "rte_eth_af_packet.h"
-
 #define ETH_AF_PACKET_IFACE_ARG		"iface"
 #define ETH_AF_PACKET_NUM_Q_ARG		"qpairs"
 #define ETH_AF_PACKET_BLOCKSIZE_ARG	"blocksz"
@@ -64,6 +62,8 @@
 #define DFLT_BLOCK_SIZE		(1 << 12)
 #define DFLT_FRAME_SIZE		(1 << 11)
 #define DFLT_FRAME_COUNT	(1 << 9)
+
+#define RTE_PMD_AF_PACKET_MAX_RINGS 16
 
 struct pkt_rx_queue {
 	int sockfd;
@@ -78,6 +78,7 @@ struct pkt_rx_queue {
 
 	volatile unsigned long rx_pkts;
 	volatile unsigned long err_pkts;
+	volatile unsigned long rx_bytes;
 };
 
 struct pkt_tx_queue {
@@ -90,6 +91,7 @@ struct pkt_tx_queue {
 
 	volatile unsigned long tx_pkts;
 	volatile unsigned long err_pkts;
+	volatile unsigned long tx_bytes;
 };
 
 struct pmd_internals {
@@ -116,9 +118,10 @@ static const char *valid_arguments[] = {
 static const char *drivername = "AF_PACKET PMD";
 
 static struct rte_eth_link pmd_link = {
-	.link_speed = 10000,
+	.link_speed = ETH_SPEED_NUM_10G,
 	.link_duplex = ETH_LINK_FULL_DUPLEX,
-	.link_status = 0
+	.link_status = ETH_LINK_DOWN,
+	.link_autoneg = ETH_LINK_SPEED_AUTONEG
 };
 
 static uint16_t
@@ -130,6 +133,7 @@ eth_af_packet_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 	uint8_t *pbuf;
 	struct pkt_rx_queue *pkt_q = queue;
 	uint16_t num_rx = 0;
+	unsigned long num_rx_bytes = 0;
 	unsigned int framecount, framenum;
 
 	if (unlikely(nb_pkts == 0))
@@ -166,9 +170,11 @@ eth_af_packet_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 		/* account for the receive frame */
 		bufs[i] = mbuf;
 		num_rx++;
+		num_rx_bytes += mbuf->pkt_len;
 	}
 	pkt_q->framenum = framenum;
 	pkt_q->rx_pkts += num_rx;
+	pkt_q->rx_bytes += num_rx_bytes;
 	return num_rx;
 }
 
@@ -185,6 +191,7 @@ eth_af_packet_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 	struct pollfd pfd;
 	struct pkt_tx_queue *pkt_q = queue;
 	uint16_t num_tx = 0;
+	unsigned long num_tx_bytes = 0;
 	int i;
 
 	if (unlikely(nb_pkts == 0))
@@ -218,6 +225,7 @@ eth_af_packet_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 		ppd = (struct tpacket2_hdr *) pkt_q->rd[framenum].iov_base;
 
 		num_tx++;
+		num_tx_bytes += mbuf->pkt_len;
 		rte_pktmbuf_free(mbuf);
 	}
 
@@ -228,13 +236,14 @@ eth_af_packet_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 	pkt_q->framenum = framenum;
 	pkt_q->tx_pkts += num_tx;
 	pkt_q->err_pkts += nb_pkts - num_tx;
+	pkt_q->tx_bytes += num_tx_bytes;
 	return num_tx;
 }
 
 static int
 eth_dev_start(struct rte_eth_dev *dev)
 {
-	dev->data->dev_link.link_status = 1;
+	dev->data->dev_link.link_status = ETH_LINK_UP;
 	return 0;
 }
 
@@ -257,7 +266,7 @@ eth_dev_stop(struct rte_eth_dev *dev)
 			close(sockfd);
 	}
 
-	dev->data->dev_link.link_status = 0;
+	dev->data->dev_link.link_status = ETH_LINK_DOWN;
 }
 
 static int
@@ -286,13 +295,16 @@ eth_stats_get(struct rte_eth_dev *dev, struct rte_eth_stats *igb_stats)
 {
 	unsigned i, imax;
 	unsigned long rx_total = 0, tx_total = 0, tx_err_total = 0;
+	unsigned long rx_bytes_total = 0, tx_bytes_total = 0;
 	const struct pmd_internals *internal = dev->data->dev_private;
 
 	imax = (internal->nb_queues < RTE_ETHDEV_QUEUE_STAT_CNTRS ?
 	        internal->nb_queues : RTE_ETHDEV_QUEUE_STAT_CNTRS);
 	for (i = 0; i < imax; i++) {
 		igb_stats->q_ipackets[i] = internal->rx_queue[i].rx_pkts;
+		igb_stats->q_ibytes[i] = internal->rx_queue[i].rx_bytes;
 		rx_total += igb_stats->q_ipackets[i];
+		rx_bytes_total += igb_stats->q_ibytes[i];
 	}
 
 	imax = (internal->nb_queues < RTE_ETHDEV_QUEUE_STAT_CNTRS ?
@@ -300,13 +312,17 @@ eth_stats_get(struct rte_eth_dev *dev, struct rte_eth_stats *igb_stats)
 	for (i = 0; i < imax; i++) {
 		igb_stats->q_opackets[i] = internal->tx_queue[i].tx_pkts;
 		igb_stats->q_errors[i] = internal->tx_queue[i].err_pkts;
+		igb_stats->q_obytes[i] = internal->tx_queue[i].tx_bytes;
 		tx_total += igb_stats->q_opackets[i];
 		tx_err_total += igb_stats->q_errors[i];
+		tx_bytes_total += igb_stats->q_obytes[i];
 	}
 
 	igb_stats->ipackets = rx_total;
+	igb_stats->ibytes = rx_bytes_total;
 	igb_stats->opackets = tx_total;
 	igb_stats->oerrors = tx_err_total;
+	igb_stats->obytes = tx_bytes_total;
 }
 
 static void
@@ -315,12 +331,15 @@ eth_stats_reset(struct rte_eth_dev *dev)
 	unsigned i;
 	struct pmd_internals *internal = dev->data->dev_private;
 
-	for (i = 0; i < internal->nb_queues; i++)
+	for (i = 0; i < internal->nb_queues; i++) {
 		internal->rx_queue[i].rx_pkts = 0;
+		internal->rx_queue[i].rx_bytes = 0;
+	}
 
 	for (i = 0; i < internal->nb_queues; i++) {
 		internal->tx_queue[i].tx_pkts = 0;
 		internal->tx_queue[i].err_pkts = 0;
+		internal->tx_queue[i].tx_bytes = 0;
 	}
 }
 
@@ -667,11 +686,13 @@ rte_pmd_init_internals(const char *name,
 	data->nb_tx_queues = (uint16_t)nb_queues;
 	data->dev_link = pmd_link;
 	data->mac_addrs = &(*internals)->eth_addr;
+	strncpy(data->name,
+		(*eth_dev)->data->name, strlen((*eth_dev)->data->name));
 
 	(*eth_dev)->data = data;
 	(*eth_dev)->dev_ops = &ops;
 	(*eth_dev)->driver = NULL;
-	(*eth_dev)->data->dev_flags = 0;
+	(*eth_dev)->data->dev_flags = RTE_ETH_DEV_DETACHABLE;
 	(*eth_dev)->data->drv_name = drivername;
 	(*eth_dev)->data->kdrv = RTE_KDRV_NONE;
 	(*eth_dev)->data->numa_node = numa_node;
@@ -798,7 +819,7 @@ rte_eth_from_packet(const char *name,
 	return 0;
 }
 
-int
+static int
 rte_pmd_af_packet_devinit(const char *name, const char *params)
 {
 	unsigned numa_node;
@@ -836,10 +857,48 @@ exit:
 	return ret;
 }
 
+static int
+rte_pmd_af_packet_devuninit(const char *name)
+{
+	struct rte_eth_dev *eth_dev = NULL;
+	struct pmd_internals *internals;
+	unsigned q;
+
+	RTE_LOG(INFO, PMD, "Closing AF_PACKET ethdev on numa socket %u\n",
+			rte_socket_id());
+
+	if (name == NULL)
+		return -1;
+
+	/* find the ethdev entry */
+	eth_dev = rte_eth_dev_allocated(name);
+	if (eth_dev == NULL)
+		return -1;
+
+	internals = eth_dev->data->dev_private;
+	for (q = 0; q < internals->nb_queues; q++) {
+		rte_free(internals->rx_queue[q].rd);
+		rte_free(internals->tx_queue[q].rd);
+	}
+
+	rte_free(eth_dev->data->dev_private);
+	rte_free(eth_dev->data);
+
+	rte_eth_dev_release_port(eth_dev);
+
+	return 0;
+}
+
 static struct rte_driver pmd_af_packet_drv = {
-	.name = "eth_af_packet",
 	.type = PMD_VDEV,
 	.init = rte_pmd_af_packet_devinit,
+	.uninit = rte_pmd_af_packet_devuninit,
 };
 
-PMD_REGISTER_DRIVER(pmd_af_packet_drv);
+PMD_REGISTER_DRIVER(pmd_af_packet_drv, eth_af_packet);
+DRIVER_REGISTER_PARAM_STRING(eth_af_packet,
+	"iface=<string> "
+	"qpairs=<int> "
+	"blocksz=<int> "
+	"framesz=<int> "
+	"framecnt=<int>");

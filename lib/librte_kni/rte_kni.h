@@ -101,7 +101,7 @@ struct rte_kni_conf {
  * @param max_kni_ifaces
  *  The maximum number of KNI interfaces that can coexist concurrently
  */
-extern void rte_kni_init(unsigned int max_kni_ifaces);
+void rte_kni_init(unsigned int max_kni_ifaces);
 
 
 /**
@@ -112,6 +112,9 @@ extern void rte_kni_init(unsigned int max_kni_ifaces);
  *
  * The rte_kni_alloc shall not be called before rte_kni_init() has been
  * called. rte_kni_alloc is thread safe.
+ *
+ * The mempool should have capacity of more than "2 x KNI_FIFO_COUNT_MAX"
+ * elements for each KNI interface allocated.
  *
  * @param pktmbuf_pool
  *  The mempool for allocting mbufs for packets.
@@ -124,9 +127,8 @@ extern void rte_kni_init(unsigned int max_kni_ifaces);
  *  - The pointer to the context of a KNI interface.
  *  - NULL indicate error.
  */
-extern struct rte_kni *rte_kni_alloc(struct rte_mempool *pktmbuf_pool,
-				     const struct rte_kni_conf *conf,
-				     struct rte_kni_ops *ops);
+struct rte_kni *rte_kni_alloc(struct rte_mempool *pktmbuf_pool,
+		const struct rte_kni_conf *conf, struct rte_kni_ops *ops);
 
 /**
  * Release KNI interface according to the context. It will also release the
@@ -142,7 +144,7 @@ extern struct rte_kni *rte_kni_alloc(struct rte_mempool *pktmbuf_pool,
  *  - 0 indicates success.
  *  - negative value indicates failure.
  */
-extern int rte_kni_release(struct rte_kni *kni);
+int rte_kni_release(struct rte_kni *kni);
 
 /**
  * It is used to handle the request mbufs sent from kernel space.
@@ -156,29 +158,10 @@ extern int rte_kni_release(struct rte_kni *kni);
  *  - 0
  *  - negative value indicates failure.
  */
-extern int rte_kni_handle_request(struct rte_kni *kni);
+int rte_kni_handle_request(struct rte_kni *kni);
 
 /**
  * Retrieve a burst of packets from a KNI interface. The retrieved packets are
- * stored in rte_mbuf structures whose pointers are supplied in the array of
- * mbufs, and the maximum number is indicated by num. It handles the freeing of
- * the mbufs in the free queue of KNI interface.
- *
- * @param kni
- *  The KNI interface context.
- * @param mbufs
- *  The array to store the pointers of mbufs.
- * @param num
- *  The maximum number per burst.
- *
- * @return
- *  The actual number of packets retrieved.
- */
-extern unsigned rte_kni_rx_burst(struct rte_kni *kni,
-		struct rte_mbuf **mbufs, unsigned num);
-
-/**
- * Send a burst of packets to a KNI interface. The packets to be sent out are
  * stored in rte_mbuf structures whose pointers are supplied in the array of
  * mbufs, and the maximum number is indicated by num. It handles allocating
  * the mbufs for KNI interface alloc queue.
@@ -191,10 +174,29 @@ extern unsigned rte_kni_rx_burst(struct rte_kni *kni,
  *  The maximum number per burst.
  *
  * @return
+ *  The actual number of packets retrieved.
+ */
+unsigned rte_kni_rx_burst(struct rte_kni *kni, struct rte_mbuf **mbufs,
+		unsigned num);
+
+/**
+ * Send a burst of packets to a KNI interface. The packets to be sent out are
+ * stored in rte_mbuf structures whose pointers are supplied in the array of
+ * mbufs, and the maximum number is indicated by num. It handles the freeing of
+ * the mbufs in the free queue of KNI interface.
+ *
+ * @param kni
+ *  The KNI interface context.
+ * @param mbufs
+ *  The array to store the pointers of mbufs.
+ * @param num
+ *  The maximum number per burst.
+ *
+ * @return
  *  The actual number of packets sent.
  */
-extern unsigned rte_kni_tx_burst(struct rte_kni *kni,
-		struct rte_mbuf **mbufs, unsigned num);
+unsigned rte_kni_tx_burst(struct rte_kni *kni, struct rte_mbuf **mbufs,
+		unsigned num);
 
 /**
  * Get the KNI context of its name.
@@ -206,7 +208,7 @@ extern unsigned rte_kni_tx_burst(struct rte_kni *kni,
  *  On success: Pointer to KNI interface.
  *  On failure: NULL.
  */
-extern struct rte_kni *rte_kni_get(const char *name);
+struct rte_kni *rte_kni_get(const char *name);
 
 /**
  * Get the name given to a KNI device
@@ -216,7 +218,7 @@ extern struct rte_kni *rte_kni_get(const char *name);
  * @return
  *   The pointer to the KNI name
  */
-extern const char *rte_kni_get_name(const struct rte_kni *kni);
+const char *rte_kni_get_name(const struct rte_kni *kni);
 
 /**
  * Register KNI request handling for a specified port,and it can
@@ -231,8 +233,7 @@ extern const char *rte_kni_get_name(const struct rte_kni *kni);
  *  On success: 0
  *  On failure: -1
  */
-extern int rte_kni_register_handlers(struct rte_kni *kni,
-			struct rte_kni_ops *ops);
+int rte_kni_register_handlers(struct rte_kni *kni, struct rte_kni_ops *ops);
 
 /**
  *  Unregister KNI request handling for a specified port.
@@ -244,12 +245,12 @@ extern int rte_kni_register_handlers(struct rte_kni *kni,
  *   On success: 0
  *   On failure: -1
  */
-extern int rte_kni_unregister_handlers(struct rte_kni *kni);
+int rte_kni_unregister_handlers(struct rte_kni *kni);
 
 /**
  *  Close KNI device.
  */
-extern void rte_kni_close(void);
+void rte_kni_close(void);
 
 #ifdef __cplusplus
 }

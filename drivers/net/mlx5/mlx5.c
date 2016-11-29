@@ -37,6 +37,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <net/if.h>
 
 /* Verbs header. */
@@ -57,6 +58,7 @@
 #include <rte_ethdev.h>
 #include <rte_pci.h>
 #include <rte_common.h>
+#include <rte_kvargs.h>
 #ifdef PEDANTIC
 #pragma GCC diagnostic error "-pedantic"
 #endif
@@ -66,6 +68,40 @@
 #include "mlx5_rxtx.h"
 #include "mlx5_autoconf.h"
 #include "mlx5_defs.h"
+
+/* Device parameter to enable RX completion queue compression. */
+#define MLX5_RXQ_CQE_COMP_EN "rxq_cqe_comp_en"
+
+/* Device parameter to configure inline send. */
+#define MLX5_TXQ_INLINE "txq_inline"
+
+/*
+ * Device parameter to configure the number of TX queues threshold for
+ * enabling inline send.
+ */
+#define MLX5_TXQS_MIN_INLINE "txqs_min_inline"
+
+/* Device parameter to enable multi-packet send WQEs. */
+#define MLX5_TXQ_MPW_EN "txq_mpw_en"
+
+/**
+ * Retrieve integer value from environment variable.
+ *
+ * @param[in] name
+ *   Environment variable name.
+ *
+ * @return
+ *   Integer value, 0 if the variable is not set.
+ */
+int
+mlx5_getenv_int(const char *name)
+{
+	const char *val = getenv(name);
+
+	if (val == NULL)
+		return 0;
+	return atoi(val);
+}
 
 /**
  * DPDK callback to close the device.
@@ -78,8 +114,7 @@
 static void
 mlx5_dev_close(struct rte_eth_dev *dev)
 {
-	struct priv *priv = dev->data->dev_private;
-	void *tmp;
+	struct priv *priv = mlx5_get_priv(dev);
 	unsigned int i;
 
 	priv_lock(priv);
@@ -88,10 +123,14 @@ mlx5_dev_close(struct rte_eth_dev *dev)
 	      ((priv->ctx != NULL) ? priv->ctx->device->name : ""));
 	/* In case mlx5_dev_stop() has not been called. */
 	priv_dev_interrupt_handler_uninstall(priv, dev);
-	priv_allmulticast_disable(priv);
-	priv_promiscuous_disable(priv);
+	priv_special_flow_disable_all(priv);
 	priv_mac_addrs_disable(priv);
 	priv_destroy_hash_rxqs(priv);
+
+	/* Remove flow director elements. */
+	priv_fdir_disable(priv);
+	priv_fdir_delete_filters_list(priv);
+
 	/* Prevent crashes when queues are still in use. */
 	dev->rx_pkt_burst = removed_rx_burst;
 	dev->tx_pkt_burst = removed_tx_burst;
@@ -99,12 +138,15 @@ mlx5_dev_close(struct rte_eth_dev *dev)
 		/* XXX race condition if mlx5_rx_burst() is still running. */
 		usleep(1000);
 		for (i = 0; (i != priv->rxqs_n); ++i) {
-			tmp = (*priv->rxqs)[i];
-			if (tmp == NULL)
+			struct rxq *rxq = (*priv->rxqs)[i];
+			struct rxq_ctrl *rxq_ctrl;
+
+			if (rxq == NULL)
 				continue;
+			rxq_ctrl = container_of(rxq, struct rxq_ctrl, rxq);
 			(*priv->rxqs)[i] = NULL;
-			rxq_cleanup(tmp);
-			rte_free(tmp);
+			rxq_cleanup(rxq_ctrl);
+			rte_free(rxq_ctrl);
 		}
 		priv->rxqs_n = 0;
 		priv->rxqs = NULL;
@@ -113,12 +155,15 @@ mlx5_dev_close(struct rte_eth_dev *dev)
 		/* XXX race condition if mlx5_tx_burst() is still running. */
 		usleep(1000);
 		for (i = 0; (i != priv->txqs_n); ++i) {
-			tmp = (*priv->txqs)[i];
-			if (tmp == NULL)
+			struct txq *txq = (*priv->txqs)[i];
+			struct txq_ctrl *txq_ctrl;
+
+			if (txq == NULL)
 				continue;
+			txq_ctrl = container_of(txq, struct txq_ctrl, txq);
 			(*priv->txqs)[i] = NULL;
-			txq_cleanup(tmp);
-			rte_free(tmp);
+			txq_cleanup(txq_ctrl);
+			rte_free(txq_ctrl);
 		}
 		priv->txqs_n = 0;
 		priv->txqs = NULL;
@@ -144,6 +189,8 @@ static const struct eth_dev_ops mlx5_dev_ops = {
 	.dev_configure = mlx5_dev_configure,
 	.dev_start = mlx5_dev_start,
 	.dev_stop = mlx5_dev_stop,
+	.dev_set_link_down = mlx5_set_link_down,
+	.dev_set_link_up = mlx5_set_link_up,
 	.dev_close = mlx5_dev_close,
 	.promiscuous_enable = mlx5_promiscuous_enable,
 	.promiscuous_disable = mlx5_promiscuous_disable,
@@ -153,6 +200,7 @@ static const struct eth_dev_ops mlx5_dev_ops = {
 	.stats_get = mlx5_stats_get,
 	.stats_reset = mlx5_stats_reset,
 	.dev_infos_get = mlx5_dev_infos_get,
+	.dev_supported_ptypes_get = mlx5_dev_supported_ptypes_get,
 	.vlan_filter_set = mlx5_vlan_filter_set,
 	.rx_queue_setup = mlx5_rx_queue_setup,
 	.tx_queue_setup = mlx5_tx_queue_setup,
@@ -162,11 +210,15 @@ static const struct eth_dev_ops mlx5_dev_ops = {
 	.flow_ctrl_set = mlx5_dev_set_flow_ctrl,
 	.mac_addr_remove = mlx5_mac_addr_remove,
 	.mac_addr_add = mlx5_mac_addr_add,
+	.mac_addr_set = mlx5_mac_addr_set,
 	.mtu_set = mlx5_dev_set_mtu,
+	.vlan_strip_queue_set = mlx5_vlan_strip_queue_set,
+	.vlan_offload_set = mlx5_vlan_offload_set,
 	.reta_update = mlx5_dev_rss_reta_update,
 	.reta_query = mlx5_dev_rss_reta_query,
 	.rss_hash_update = mlx5_rss_hash_update,
 	.rss_hash_conf_get = mlx5_rss_hash_conf_get,
+	.filter_ctrl = mlx5_dev_filter_ctrl,
 };
 
 static struct {
@@ -202,6 +254,90 @@ mlx5_dev_idx(struct rte_pci_addr *pci_addr)
 	return ret;
 }
 
+/**
+ * Verify and store value for device argument.
+ *
+ * @param[in] key
+ *   Key argument to verify.
+ * @param[in] val
+ *   Value associated with key.
+ * @param opaque
+ *   User data.
+ *
+ * @return
+ *   0 on success, negative errno value on failure.
+ */
+static int
+mlx5_args_check(const char *key, const char *val, void *opaque)
+{
+	struct priv *priv = opaque;
+	unsigned long tmp;
+
+	errno = 0;
+	tmp = strtoul(val, NULL, 0);
+	if (errno) {
+		WARN("%s: \"%s\" is not a valid integer", key, val);
+		return errno;
+	}
+	if (strcmp(MLX5_RXQ_CQE_COMP_EN, key) == 0) {
+		priv->cqe_comp = !!tmp;
+	} else if (strcmp(MLX5_TXQ_INLINE, key) == 0) {
+		priv->txq_inline = tmp;
+	} else if (strcmp(MLX5_TXQS_MIN_INLINE, key) == 0) {
+		priv->txqs_inline = tmp;
+	} else if (strcmp(MLX5_TXQ_MPW_EN, key) == 0) {
+		priv->mps = !!tmp;
+	} else {
+		WARN("%s: unknown parameter", key);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/**
+ * Parse device parameters.
+ *
+ * @param priv
+ *   Pointer to private structure.
+ * @param devargs
+ *   Device arguments structure.
+ *
+ * @return
+ *   0 on success, errno value on failure.
+ */
+static int
+mlx5_args(struct priv *priv, struct rte_devargs *devargs)
+{
+	const char **params = (const char *[]){
+		MLX5_RXQ_CQE_COMP_EN,
+		MLX5_TXQ_INLINE,
+		MLX5_TXQS_MIN_INLINE,
+		MLX5_TXQ_MPW_EN,
+		NULL,
+	};
+	struct rte_kvargs *kvlist;
+	int ret = 0;
+	int i;
+
+	if (devargs == NULL)
+		return 0;
+	/* Following UGLY cast is done to pass checkpatch. */
+	kvlist = rte_kvargs_parse(devargs->args, params);
+	if (kvlist == NULL)
+		return 0;
+	/* Process parameters. */
+	for (i = 0; (params[i] != NULL); ++i) {
+		if (rte_kvargs_count(kvlist, params[i])) {
+			ret = rte_kvargs_process(kvlist, params[i],
+						 mlx5_args_check, priv);
+			if (ret != 0)
+				return ret;
+		}
+	}
+	rte_kvargs_free(kvlist);
+	return 0;
+}
+
 static struct eth_driver mlx5_driver;
 
 /**
@@ -226,7 +362,8 @@ mlx5_pci_devinit(struct rte_pci_driver *pci_drv, struct rte_pci_device *pci_dev)
 	int err = 0;
 	struct ibv_context *attr_ctx = NULL;
 	struct ibv_device_attr device_attr;
-	unsigned int vf;
+	unsigned int sriov;
+	unsigned int mps;
 	int idx;
 	int i;
 
@@ -268,12 +405,18 @@ mlx5_pci_devinit(struct rte_pci_driver *pci_drv, struct rte_pci_device *pci_dev)
 		    (pci_dev->addr.devid != pci_addr.devid) ||
 		    (pci_dev->addr.function != pci_addr.function))
 			continue;
-		vf = ((pci_dev->id.device_id ==
+		sriov = ((pci_dev->id.device_id ==
 		       PCI_DEVICE_ID_MELLANOX_CONNECTX4VF) ||
 		      (pci_dev->id.device_id ==
 		       PCI_DEVICE_ID_MELLANOX_CONNECTX4LXVF));
-		INFO("PCI information matches, using device \"%s\" (VF: %s)",
-		     list[i]->name, (vf ? "true" : "false"));
+		/* Multi-packet send is only supported by ConnectX-4 Lx PF. */
+		mps = (pci_dev->id.device_id ==
+		       PCI_DEVICE_ID_MELLANOX_CONNECTX4LX);
+		INFO("PCI information matches, using device \"%s\""
+		     " (SR-IOV: %s, MPS: %s)",
+		     list[i]->name,
+		     sriov ? "true" : "false",
+		     mps ? "true" : "false");
 		attr_ctx = ibv_open_device(list[i]);
 		err = errno;
 		break;
@@ -306,16 +449,16 @@ mlx5_pci_devinit(struct rte_pci_driver *pci_drv, struct rte_pci_device *pci_dev)
 		struct ibv_pd *pd = NULL;
 		struct priv *priv = NULL;
 		struct rte_eth_dev *eth_dev;
-#ifdef HAVE_EXP_QUERY_DEVICE
 		struct ibv_exp_device_attr exp_device_attr;
-#endif /* HAVE_EXP_QUERY_DEVICE */
 		struct ether_addr mac;
+		uint16_t num_vfs = 0;
 
-#ifdef HAVE_EXP_QUERY_DEVICE
 		exp_device_attr.comp_mask =
 			IBV_EXP_DEVICE_ATTR_EXP_CAP_FLAGS |
-			IBV_EXP_DEVICE_ATTR_RX_HASH;
-#endif /* HAVE_EXP_QUERY_DEVICE */
+			IBV_EXP_DEVICE_ATTR_RX_HASH |
+			IBV_EXP_DEVICE_ATTR_VLAN_OFFLOADS |
+			IBV_EXP_DEVICE_ATTR_RX_PAD_END_ALIGN |
+			0;
 
 		DEBUG("using port %u (%08" PRIx32 ")", port, test);
 
@@ -329,6 +472,13 @@ mlx5_pci_devinit(struct rte_pci_driver *pci_drv, struct rte_pci_device *pci_dev)
 			ERROR("port query failed: %s", strerror(err));
 			goto port_error;
 		}
+
+		if (port_attr.link_layer != IBV_LINK_LAYER_ETHERNET) {
+			ERROR("port %d is not configured in Ethernet mode",
+			      port);
+			goto port_error;
+		}
+
 		if (port_attr.state != IBV_PORT_ACTIVE)
 			DEBUG("port %d is not active: \"%s\" (%d)",
 			      port, ibv_port_state_str(port_attr.state),
@@ -359,7 +509,14 @@ mlx5_pci_devinit(struct rte_pci_driver *pci_drv, struct rte_pci_device *pci_dev)
 		priv->port = port;
 		priv->pd = pd;
 		priv->mtu = ETHER_MTU;
-#ifdef HAVE_EXP_QUERY_DEVICE
+		priv->mps = mps; /* Enable MPW by default if supported. */
+		priv->cqe_comp = 1; /* Enable compression by default. */
+		err = mlx5_args(priv, pci_dev->devargs);
+		if (err) {
+			ERROR("failed to process device arguments: %s",
+			      strerror(err));
+			goto port_error;
+		}
 		if (ibv_exp_query_device(ctx, &exp_device_attr)) {
 			ERROR("ibv_exp_query_device() failed");
 			goto port_error;
@@ -385,12 +542,28 @@ mlx5_pci_devinit(struct rte_pci_driver *pci_drv, struct rte_pci_device *pci_dev)
 			priv->ind_table_max_size = RSS_INDIRECTION_TABLE_SIZE;
 		DEBUG("maximum RX indirection table size is %u",
 		      priv->ind_table_max_size);
+		priv->hw_vlan_strip = !!(exp_device_attr.wq_vlan_offloads_cap &
+					 IBV_EXP_RECEIVE_WQ_CVLAN_STRIP);
+		DEBUG("VLAN stripping is %ssupported",
+		      (priv->hw_vlan_strip ? "" : "not "));
 
-#else /* HAVE_EXP_QUERY_DEVICE */
-		priv->ind_table_max_size = RSS_INDIRECTION_TABLE_SIZE;
-#endif /* HAVE_EXP_QUERY_DEVICE */
+		priv->hw_fcs_strip = !!(exp_device_attr.exp_device_cap_flags &
+					IBV_EXP_DEVICE_SCATTER_FCS);
+		DEBUG("FCS stripping configuration is %ssupported",
+		      (priv->hw_fcs_strip ? "" : "not "));
 
-		priv->vf = vf;
+		priv->hw_padding = !!exp_device_attr.rx_pad_end_addr_align;
+		DEBUG("hardware RX end alignment padding is %ssupported",
+		      (priv->hw_padding ? "" : "not "));
+
+		priv_get_num_vfs(priv, &num_vfs);
+		priv->sriov = (num_vfs || sriov);
+		if (priv->mps && !mps) {
+			ERROR("multi-packet send not supported on this device"
+			      " (" MLX5_TXQ_MPW_EN ")");
+			err = ENOTSUP;
+			goto port_error;
+		}
 		/* Allocate and register default RSS hash keys. */
 		priv->rss_conf = rte_calloc(__func__, hash_rxq_init_n,
 					    sizeof((*priv->rss_conf)[0]), 0);
@@ -415,13 +588,14 @@ mlx5_pci_devinit(struct rte_pci_driver *pci_drv, struct rte_pci_device *pci_dev)
 		     mac.addr_bytes[0], mac.addr_bytes[1],
 		     mac.addr_bytes[2], mac.addr_bytes[3],
 		     mac.addr_bytes[4], mac.addr_bytes[5]);
-		/* Register MAC and broadcast addresses. */
+		/* Register MAC address. */
 		claim_zero(priv_mac_addr_add(priv, 0,
 					     (const uint8_t (*)[ETHER_ADDR_LEN])
 					     mac.addr_bytes));
-		claim_zero(priv_mac_addr_add(priv, (RTE_DIM(priv->mac) - 1),
-					     &(const uint8_t [ETHER_ADDR_LEN])
-					     { "\xff\xff\xff\xff\xff\xff" }));
+		/* Initialize FD filters list. */
+		err = fdir_init_filters_list(priv);
+		if (err)
+			goto port_error;
 #ifndef NDEBUG
 		{
 			char ifname[IF_NAMESIZE];
@@ -451,18 +625,44 @@ mlx5_pci_devinit(struct rte_pci_driver *pci_drv, struct rte_pci_device *pci_dev)
 			goto port_error;
 		}
 
-		eth_dev->data->dev_private = priv;
+		/* Secondary processes have to use local storage for their
+		 * private data as well as a copy of eth_dev->data, but this
+		 * pointer must not be modified before burst functions are
+		 * actually called. */
+		if (mlx5_is_secondary()) {
+			struct mlx5_secondary_data *sd =
+				&mlx5_secondary_data[eth_dev->data->port_id];
+			sd->primary_priv = eth_dev->data->dev_private;
+			if (sd->primary_priv == NULL) {
+				ERROR("no private data for port %u",
+						eth_dev->data->port_id);
+				err = EINVAL;
+				goto port_error;
+			}
+			sd->shared_dev_data = eth_dev->data;
+			rte_spinlock_init(&sd->lock);
+			memcpy(sd->data.name, sd->shared_dev_data->name,
+				   sizeof(sd->data.name));
+			sd->data.dev_private = priv;
+			sd->data.rx_mbuf_alloc_failed = 0;
+			sd->data.mtu = ETHER_MTU;
+			sd->data.port_id = sd->shared_dev_data->port_id;
+			sd->data.mac_addrs = priv->mac;
+			eth_dev->tx_pkt_burst = mlx5_tx_burst_secondary_setup;
+			eth_dev->rx_pkt_burst = mlx5_rx_burst_secondary_setup;
+		} else {
+			eth_dev->data->dev_private = priv;
+			eth_dev->data->rx_mbuf_alloc_failed = 0;
+			eth_dev->data->mtu = ETHER_MTU;
+			eth_dev->data->mac_addrs = priv->mac;
+		}
+
 		eth_dev->pci_dev = pci_dev;
-
 		rte_eth_copy_pci_info(eth_dev, pci_dev);
-
 		eth_dev->driver = &mlx5_driver;
-		eth_dev->data->rx_mbuf_alloc_failed = 0;
-		eth_dev->data->mtu = ETHER_MTU;
-
 		priv->dev = eth_dev;
 		eth_dev->dev_ops = &mlx5_dev_ops;
-		eth_dev->data->mac_addrs = priv->mac;
+
 		TAILQ_INIT(&eth_dev->link_intr_cbs);
 
 		/* Bring Ethernet device up. */
@@ -471,8 +671,10 @@ mlx5_pci_devinit(struct rte_pci_driver *pci_drv, struct rte_pci_device *pci_dev)
 		continue;
 
 port_error:
-		rte_free(priv->rss_conf);
-		rte_free(priv);
+		if (priv) {
+			rte_free(priv->rss_conf);
+			rte_free(priv);
+		}
 		if (pd)
 			claim_zero(ibv_dealloc_pd(pd));
 		if (ctx)
@@ -504,28 +706,20 @@ error:
 
 static const struct rte_pci_id mlx5_pci_id_map[] = {
 	{
-		.vendor_id = PCI_VENDOR_ID_MELLANOX,
-		.device_id = PCI_DEVICE_ID_MELLANOX_CONNECTX4,
-		.subsystem_vendor_id = PCI_ANY_ID,
-		.subsystem_device_id = PCI_ANY_ID
+		RTE_PCI_DEVICE(PCI_VENDOR_ID_MELLANOX,
+			       PCI_DEVICE_ID_MELLANOX_CONNECTX4)
 	},
 	{
-		.vendor_id = PCI_VENDOR_ID_MELLANOX,
-		.device_id = PCI_DEVICE_ID_MELLANOX_CONNECTX4VF,
-		.subsystem_vendor_id = PCI_ANY_ID,
-		.subsystem_device_id = PCI_ANY_ID
+		RTE_PCI_DEVICE(PCI_VENDOR_ID_MELLANOX,
+			       PCI_DEVICE_ID_MELLANOX_CONNECTX4VF)
 	},
 	{
-		.vendor_id = PCI_VENDOR_ID_MELLANOX,
-		.device_id = PCI_DEVICE_ID_MELLANOX_CONNECTX4LX,
-		.subsystem_vendor_id = PCI_ANY_ID,
-		.subsystem_device_id = PCI_ANY_ID
+		RTE_PCI_DEVICE(PCI_VENDOR_ID_MELLANOX,
+			       PCI_DEVICE_ID_MELLANOX_CONNECTX4LX)
 	},
 	{
-		.vendor_id = PCI_VENDOR_ID_MELLANOX,
-		.device_id = PCI_DEVICE_ID_MELLANOX_CONNECTX4LXVF,
-		.subsystem_vendor_id = PCI_ANY_ID,
-		.subsystem_device_id = PCI_ANY_ID
+		RTE_PCI_DEVICE(PCI_VENDOR_ID_MELLANOX,
+			       PCI_DEVICE_ID_MELLANOX_CONNECTX4LXVF)
 	},
 	{
 		.vendor_id = 0
@@ -564,8 +758,8 @@ rte_mlx5_pmd_init(const char *name, const char *args)
 
 static struct rte_driver rte_mlx5_driver = {
 	.type = PMD_PDEV,
-	.name = MLX5_DRIVER_NAME,
 	.init = rte_mlx5_pmd_init,
 };
 
-PMD_REGISTER_DRIVER(rte_mlx5_driver)
+PMD_REGISTER_DRIVER(rte_mlx5_driver, mlx5);
+DRIVER_REGISTER_PCI_TABLE(mlx5, mlx5_pci_id_map);

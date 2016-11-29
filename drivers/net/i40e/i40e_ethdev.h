@@ -36,6 +36,7 @@
 
 #include <rte_eth_ctrl.h>
 #include <rte_time.h>
+#include <rte_kvargs.h>
 
 #define I40E_VLAN_TAG_SIZE        4
 
@@ -53,6 +54,11 @@
 #define I40E_DEFAULT_QP_NUM_FDIR  1
 #define I40E_UINT32_BIT_SIZE      (CHAR_BIT * sizeof(uint32_t))
 #define I40E_VFTA_SIZE            (4096 / I40E_UINT32_BIT_SIZE)
+/* Maximun number of MAC addresses */
+#define I40E_NUM_MACADDR_MAX       64
+/* Maximum number of VFs */
+#define I40E_MAX_VF               128
+
 /*
  * vlan_id is a 12 bit number.
  * The VFTA array is actually a 4096 bit array, 128 of 32bit elements.
@@ -168,6 +174,10 @@ enum i40e_flxpld_layer_idx {
 #define I40E_QUEUE_ITR_INTERVAL_DEFAULT 32 /* 32 us */
 #define I40E_QUEUE_ITR_INTERVAL_MAX     8160 /* 8160 us */
 
+/* Special FW support this floating VEB feature */
+#define FLOATING_VEB_SUPPORTED_FW_MAJ 5
+#define FLOATING_VEB_SUPPORTED_FW_MIN 0
+
 struct i40e_adapter;
 
 /**
@@ -199,14 +209,30 @@ struct i40e_vsi_list {
 struct i40e_rx_queue;
 struct i40e_tx_queue;
 
+/* Bandwidth limit information */
+struct i40e_bw_info {
+	uint16_t bw_limit;      /* BW Limit (0 = disabled) */
+	uint8_t  bw_max;        /* Max BW limit if enabled */
+
+	/* Relative credits within same TC with respect to other VSIs or Comps */
+	uint8_t  bw_ets_share_credits[I40E_MAX_TRAFFIC_CLASS];
+	/* Bandwidth limit per TC */
+	uint8_t  bw_ets_credits[I40E_MAX_TRAFFIC_CLASS];
+	/* Max bandwidth limit per TC */
+	uint8_t  bw_ets_max[I40E_MAX_TRAFFIC_CLASS];
+};
+
 /* Structure that defines a VEB */
 struct i40e_veb {
 	struct i40e_vsi_list_head head;
 	struct i40e_vsi *associate_vsi; /* Associate VSI who owns the VEB */
+	struct i40e_pf *associate_pf; /* Associate PF who owns the VEB */
 	uint16_t seid; /* The seid of VEB itself */
 	uint16_t uplink_seid; /* The uplink seid of this VEB */
 	uint16_t stats_idx;
 	struct i40e_eth_stats stats;
+	uint8_t enabled_tc;   /* The traffic class enabled */
+	struct i40e_bw_info bw_info; /* VEB bandwidth information */
 };
 
 /* i40e MACVLAN filter structure */
@@ -214,19 +240,6 @@ struct i40e_macvlan_filter {
 	struct ether_addr macaddr;
 	enum rte_mac_filter_type filter_type;
 	uint16_t vlan_id;
-};
-
-/* Bandwidth limit information */
-struct i40e_bw_info {
-	uint16_t bw_limit;      /* BW Limit (0 = disabled) */
-	uint8_t  bw_max;        /* Max BW limit if enabled */
-
-	/* Relative VSI credits within same TC with respect to other VSIs */
-	uint8_t  bw_ets_share_credits[I40E_MAX_TRAFFIC_CLASS];
-	/* Bandwidth limit per TC */
-	uint8_t  bw_ets_credits[I40E_MAX_TRAFFIC_CLASS];
-	/* Max bandwidth limit per TC */
-	uint8_t  bw_ets_max[I40E_MAX_TRAFFIC_CLASS];
 };
 
 /*
@@ -254,6 +267,7 @@ struct i40e_vsi {
 	struct i40e_vsi_list sib_vsi_list; /* sibling vsi list */
 	struct i40e_vsi *parent_vsi;
 	struct i40e_veb *veb;    /* Associated veb, could be null */
+	struct i40e_veb *floating_veb; /* Associated floating veb */
 	bool offset_loaded;
 	enum i40e_vsi_type type; /* VSI types */
 	uint16_t vlan_num;       /* Total VLAN number */
@@ -312,6 +326,7 @@ struct i40e_pf_vf {
 	uint16_t vf_idx; /* VF index in pf->vfs */
 	uint16_t lan_nb_qps; /* Actual queues allocated */
 	uint16_t reset_cnt; /* Total vf reset times */
+	struct ether_addr mac_addr;  /* Default MAC address */
 };
 
 /*
@@ -361,6 +376,8 @@ struct i40e_fdir_info {
 	struct i40e_rx_queue *rxq;
 	void *prg_pkt;                 /* memory for fdir program packet */
 	uint64_t dma_addr;             /* physic address of packet memory*/
+	/* input set bits for each pctype */
+	uint64_t input_set[I40E_FILTER_PCTYPE_MAX];
 	/*
 	 * the rule how bytes stream is extracted as flexible payload
 	 * for each payload layer, the setting can up to three elements
@@ -408,7 +425,7 @@ struct i40e_pf {
 
 	struct rte_eth_dev_data *dev_data; /* Pointer to the device data */
 	struct ether_addr dev_addr; /* PF device mac address */
-	uint64_t flags; /* PF featuer flags */
+	uint64_t flags; /* PF feature flags */
 	/* All kinds of queue pair setting for different VSIs */
 	struct i40e_pf_vf *vfs;
 	uint16_t vf_num;
@@ -427,6 +444,8 @@ struct i40e_pf {
 	uint16_t fdir_qp_offset;
 
 	uint16_t hash_lut_size; /* The size of hash lookup table */
+	/* input set bits for each pctype */
+	uint64_t hash_input_set[I40E_FILTER_PCTYPE_MAX];
 	/* store VXLAN UDP ports */
 	uint16_t vxlan_ports[I40E_MAX_PF_UDP_OFFLOAD_PORTS];
 	uint16_t vxlan_bitmap; /* Vxlan bit mask */
@@ -440,6 +459,9 @@ struct i40e_pf {
 	struct i40e_fc_conf fc_conf; /* Flow control conf */
 	struct i40e_mirror_rule_list mirror_list;
 	uint16_t nb_mirror_rule;   /* The number of mirror rules */
+	bool floating_veb; /* The flag to use the floating VEB */
+	/* The floating enable flag for the specific VF */
+	bool floating_veb_list[I40E_MAX_VF];
 };
 
 enum pending_msg {
@@ -492,9 +514,12 @@ struct i40e_vf {
 	/* Event from pf */
 	bool dev_closed;
 	bool link_up;
+	enum i40e_aq_link_speed link_speed;
 	bool vf_reset;
 	volatile uint32_t pend_cmd; /* pending command not finished yet */
+	uint32_t cmd_retval; /* return value of the cmd response from PF */
 	u16 pend_msg; /* flags indicates events from pf not handled yet */
+	uint8_t *aq_resp; /* buffer to store the adminq response from PF */
 
 	/* VSI info */
 	struct i40e_virtchnl_vf_resource *vf_res; /* All VSIs */
@@ -551,6 +576,7 @@ void i40e_vsi_queues_unbind_intr(struct i40e_vsi *vsi);
 int i40e_vsi_vlan_pvid_set(struct i40e_vsi *vsi,
 			   struct i40e_vsi_vlan_pvid_info *info);
 int i40e_vsi_config_vlan_stripping(struct i40e_vsi *vsi, bool on);
+int i40e_vsi_config_vlan_filter(struct i40e_vsi *vsi, bool on);
 uint64_t i40e_config_hena(uint64_t flags);
 uint64_t i40e_parse_hena(uint64_t flags);
 enum i40e_status_code i40e_fdir_setup_tx_resources(struct i40e_pf *pf);
@@ -569,9 +595,10 @@ int i40e_fdir_ctrl_func(struct rte_eth_dev *dev,
 int i40e_select_filter_input_set(struct i40e_hw *hw,
 				 struct rte_eth_input_set_conf *conf,
 				 enum rte_filter_type filter);
-int i40e_filter_inset_select(struct i40e_hw *hw,
-			     struct rte_eth_input_set_conf *conf,
-			     enum rte_filter_type filter);
+int i40e_hash_filter_inset_select(struct i40e_hw *hw,
+			     struct rte_eth_input_set_conf *conf);
+int i40e_fdir_filter_inset_select(struct i40e_pf *pf,
+			     struct rte_eth_input_set_conf *conf);
 
 void i40e_rxq_info_get(struct rte_eth_dev *dev, uint16_t queue_id,
 	struct rte_eth_rxq_info *qinfo);
@@ -599,7 +626,7 @@ i40e_get_vsi_from_adapter(struct i40e_adapter *adapter)
                 return NULL;
 
 	hw = I40E_DEV_PRIVATE_TO_HW(adapter);
-	if (hw->mac.type == I40E_MAC_VF) {
+	if (hw->mac.type == I40E_MAC_VF || hw->mac.type == I40E_MAC_X722_VF) {
 		struct i40e_vf *vf = I40EVF_DEV_PRIVATE_TO_VF(adapter);
 		return &vf->vsi;
 	} else {
@@ -656,7 +683,7 @@ i40e_calc_itr_interval(int16_t interval)
 		interval = I40E_QUEUE_ITR_INTERVAL_DEFAULT;
 
 	/* Convert to hardware count, as writing each 1 represents 2 us */
-	return (interval / 2);
+	return interval / 2;
 }
 
 #define I40E_VALID_FLOW(flow_type) \

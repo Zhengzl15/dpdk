@@ -1,7 +1,7 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright(c) 2010-2015 Intel Corporation. All rights reserved.
+ *   Copyright(c) 2010-2016 Intel Corporation. All rights reserved.
  *   All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
@@ -59,12 +59,10 @@
 #include <rte_compat.h>
 
 #include "rte_hash.h"
-#if defined(RTE_ARCH_X86_64) || defined(RTE_ARCH_I686) || defined(RTE_ARCH_X86_X32)
-#include "rte_cmp_x86.h"
-#endif
+#include "rte_cuckoo_hash.h"
 
-#if defined(RTE_ARCH_ARM64)
-#include "rte_cmp_arm64.h"
+#if defined(RTE_ARCH_X86)
+#include "rte_cuckoo_hash_x86.h"
 #endif
 
 TAILQ_HEAD(rte_hash_list, rte_tailq_entry);
@@ -73,93 +71,6 @@ static struct rte_tailq_elem rte_hash_tailq = {
 	.name = "RTE_HASH",
 };
 EAL_REGISTER_TAILQ(rte_hash_tailq)
-
-/* Macro to enable/disable run-time checking of function parameters */
-#if defined(RTE_LIBRTE_HASH_DEBUG)
-#define RETURN_IF_TRUE(cond, retval) do { \
-	if (cond) \
-		return retval; \
-} while (0)
-#else
-#define RETURN_IF_TRUE(cond, retval)
-#endif
-
-/* Hash function used if none is specified */
-#if defined(RTE_MACHINE_CPUFLAG_SSE4_2) || defined(RTE_MACHINE_CPUFLAG_CRC32)
-#include <rte_hash_crc.h>
-#define DEFAULT_HASH_FUNC       rte_hash_crc
-#else
-#include <rte_jhash.h>
-#define DEFAULT_HASH_FUNC       rte_jhash
-#endif
-
-/** Number of items per bucket. */
-#define RTE_HASH_BUCKET_ENTRIES		4
-
-#define NULL_SIGNATURE			0
-
-#define KEY_ALIGNMENT			16
-
-#define LCORE_CACHE_SIZE		8
-
-struct lcore_cache {
-	unsigned len; /**< Cache len */
-	void *objs[LCORE_CACHE_SIZE]; /**< Cache objects */
-} __rte_cache_aligned;
-
-/** A hash table structure. */
-struct rte_hash {
-	char name[RTE_HASH_NAMESIZE];   /**< Name of the hash. */
-	uint32_t entries;               /**< Total table entries. */
-	uint32_t num_buckets;           /**< Number of buckets in table. */
-	uint32_t key_len;               /**< Length of hash key. */
-	rte_hash_function hash_func;    /**< Function used to calculate hash. */
-	uint32_t hash_func_init_val;    /**< Init value used by hash_func. */
-	rte_hash_cmp_eq_t rte_hash_cmp_eq; /**< Function used to compare keys. */
-	uint32_t bucket_bitmask;        /**< Bitmask for getting bucket index
-						from hash signature. */
-	uint32_t key_entry_size;         /**< Size of each key entry. */
-
-	struct rte_ring *free_slots;    /**< Ring that stores all indexes
-						of the free slots in the key table */
-	void *key_store;                /**< Table storing all keys and data */
-	struct rte_hash_bucket *buckets;	/**< Table with buckets storing all the
-							hash values and key indexes
-							to the key table*/
-	uint8_t hw_trans_mem_support;	/**< Hardware transactional
-							memory support */
-	struct lcore_cache *local_free_slots;
-	/**< Local cache per lcore, storing some indexes of the free slots */
-} __rte_cache_aligned;
-
-/* Structure storing both primary and secondary hashes */
-struct rte_hash_signatures {
-	union {
-		struct {
-			hash_sig_t current;
-			hash_sig_t alt;
-		};
-		uint64_t sig;
-	};
-};
-
-/* Structure that stores key-value pair */
-struct rte_hash_key {
-	union {
-		uintptr_t idata;
-		void *pdata;
-	};
-	/* Variable key size */
-	char key[0];
-} __attribute__((aligned(KEY_ALIGNMENT)));
-
-/** Bucket structure */
-struct rte_hash_bucket {
-	struct rte_hash_signatures signatures[RTE_HASH_BUCKET_ENTRIES];
-	/* Includes dummy key index that always contains index 0 */
-	uint32_t key_idx[RTE_HASH_BUCKET_ENTRIES + 1];
-	uint8_t flag[RTE_HASH_BUCKET_ENTRIES];
-} __rte_cache_aligned;
 
 struct rte_hash *
 rte_hash_find_existing(const char *name)
@@ -187,7 +98,16 @@ rte_hash_find_existing(const char *name)
 
 void rte_hash_set_cmp_func(struct rte_hash *h, rte_hash_cmp_eq_t func)
 {
-	h->rte_hash_cmp_eq = func;
+	h->rte_hash_custom_cmp_eq = func;
+}
+
+static inline int
+rte_hash_cmp_eq(const void *key1, const void *key2, const struct rte_hash *h)
+{
+	if (h->cmp_jump_table_idx == KEY_CUSTOM)
+		return h->rte_hash_custom_cmp_eq(key1, key2, h->key_len);
+	else
+		return cmp_jump_table[h->cmp_jump_table_idx](key1, key2, h->key_len);
 }
 
 struct rte_hash *
@@ -226,41 +146,6 @@ rte_hash_create(const struct rte_hash_parameters *params)
 	if (params->extra_flag & RTE_HASH_EXTRA_FLAGS_TRANS_MEM_SUPPORT)
 		hw_trans_mem_support = 1;
 
-	snprintf(hash_name, sizeof(hash_name), "HT_%s", params->name);
-
-	/* Guarantee there's no existing */
-	h = rte_hash_find_existing(params->name);
-	if (h != NULL)
-		return h;
-
-	te = rte_zmalloc("HASH_TAILQ_ENTRY", sizeof(*te), 0);
-	if (te == NULL) {
-		RTE_LOG(ERR, HASH, "tailq entry allocation failed\n");
-		goto err;
-	}
-
-	h = (struct rte_hash *)rte_zmalloc_socket(hash_name, sizeof(struct rte_hash),
-					RTE_CACHE_LINE_SIZE, params->socket_id);
-
-	if (h == NULL) {
-		RTE_LOG(ERR, HASH, "memory allocation failed\n");
-		goto err;
-	}
-
-	const uint32_t num_buckets = rte_align32pow2(params->entries)
-					/ RTE_HASH_BUCKET_ENTRIES;
-
-	buckets = rte_zmalloc_socket(NULL,
-				num_buckets * sizeof(struct rte_hash_bucket),
-				RTE_CACHE_LINE_SIZE, params->socket_id);
-
-	if (buckets == NULL) {
-		RTE_LOG(ERR, HASH, "memory allocation failed\n");
-		goto err;
-	}
-
-	const uint32_t key_entry_size = sizeof(struct rte_hash_key) + params->key_len;
-
 	/* Store all keys and leave the first entry as a dummy entry for lookup_bulk */
 	if (hw_trans_mem_support)
 		/*
@@ -273,56 +158,6 @@ rte_hash_create(const struct rte_hash_parameters *params)
 	else
 		num_key_slots = params->entries + 1;
 
-	const uint64_t key_tbl_size = (uint64_t) key_entry_size * num_key_slots;
-
-	k = rte_zmalloc_socket(NULL, key_tbl_size,
-			RTE_CACHE_LINE_SIZE, params->socket_id);
-
-	if (k == NULL) {
-		RTE_LOG(ERR, HASH, "memory allocation failed\n");
-		goto err;
-	}
-
-/*
- * If x86 architecture is used, select appropriate compare function,
- * which may use x86 instrinsics, otherwise use memcmp
- */
-#if defined(RTE_ARCH_X86_64) || defined(RTE_ARCH_I686) ||\
-	 defined(RTE_ARCH_X86_X32) || defined(RTE_ARCH_ARM64)
-	/* Select function to compare keys */
-	switch (params->key_len) {
-	case 16:
-		h->rte_hash_cmp_eq = rte_hash_k16_cmp_eq;
-		break;
-	case 32:
-		h->rte_hash_cmp_eq = rte_hash_k32_cmp_eq;
-		break;
-	case 48:
-		h->rte_hash_cmp_eq = rte_hash_k48_cmp_eq;
-		break;
-	case 64:
-		h->rte_hash_cmp_eq = rte_hash_k64_cmp_eq;
-		break;
-	case 80:
-		h->rte_hash_cmp_eq = rte_hash_k80_cmp_eq;
-		break;
-	case 96:
-		h->rte_hash_cmp_eq = rte_hash_k96_cmp_eq;
-		break;
-	case 112:
-		h->rte_hash_cmp_eq = rte_hash_k112_cmp_eq;
-		break;
-	case 128:
-		h->rte_hash_cmp_eq = rte_hash_k128_cmp_eq;
-		break;
-	default:
-		/* If key is not multiple of 16, use generic memcmp */
-		h->rte_hash_cmp_eq = memcmp;
-	}
-#else
-	h->rte_hash_cmp_eq = memcmp;
-#endif
-
 	snprintf(ring_name, sizeof(ring_name), "HT_%s", params->name);
 	r = rte_ring_create(ring_name, rte_align32pow2(num_key_slots),
 			params->socket_id, 0);
@@ -330,6 +165,100 @@ rte_hash_create(const struct rte_hash_parameters *params)
 		RTE_LOG(ERR, HASH, "memory allocation failed\n");
 		goto err;
 	}
+
+	snprintf(hash_name, sizeof(hash_name), "HT_%s", params->name);
+
+	rte_rwlock_write_lock(RTE_EAL_TAILQ_RWLOCK);
+
+	/* guarantee there's no existing: this is normally already checked
+	 * by ring creation above */
+	TAILQ_FOREACH(te, hash_list, next) {
+		h = (struct rte_hash *) te->data;
+		if (strncmp(params->name, h->name, RTE_HASH_NAMESIZE) == 0)
+			break;
+	}
+	h = NULL;
+	if (te != NULL) {
+		rte_errno = EEXIST;
+		te = NULL;
+		goto err_unlock;
+	}
+
+	te = rte_zmalloc("HASH_TAILQ_ENTRY", sizeof(*te), 0);
+	if (te == NULL) {
+		RTE_LOG(ERR, HASH, "tailq entry allocation failed\n");
+		goto err_unlock;
+	}
+
+	h = (struct rte_hash *)rte_zmalloc_socket(hash_name, sizeof(struct rte_hash),
+					RTE_CACHE_LINE_SIZE, params->socket_id);
+
+	if (h == NULL) {
+		RTE_LOG(ERR, HASH, "memory allocation failed\n");
+		goto err_unlock;
+	}
+
+	const uint32_t num_buckets = rte_align32pow2(params->entries)
+					/ RTE_HASH_BUCKET_ENTRIES;
+
+	buckets = rte_zmalloc_socket(NULL,
+				num_buckets * sizeof(struct rte_hash_bucket),
+				RTE_CACHE_LINE_SIZE, params->socket_id);
+
+	if (buckets == NULL) {
+		RTE_LOG(ERR, HASH, "memory allocation failed\n");
+		goto err_unlock;
+	}
+
+	const uint32_t key_entry_size = sizeof(struct rte_hash_key) + params->key_len;
+	const uint64_t key_tbl_size = (uint64_t) key_entry_size * num_key_slots;
+
+	k = rte_zmalloc_socket(NULL, key_tbl_size,
+			RTE_CACHE_LINE_SIZE, params->socket_id);
+
+	if (k == NULL) {
+		RTE_LOG(ERR, HASH, "memory allocation failed\n");
+		goto err_unlock;
+	}
+
+/*
+ * If x86 architecture is used, select appropriate compare function,
+ * which may use x86 intrinsics, otherwise use memcmp
+ */
+#if defined(RTE_ARCH_X86) || defined(RTE_ARCH_ARM64)
+	/* Select function to compare keys */
+	switch (params->key_len) {
+	case 16:
+		h->cmp_jump_table_idx = KEY_16_BYTES;
+		break;
+	case 32:
+		h->cmp_jump_table_idx = KEY_32_BYTES;
+		break;
+	case 48:
+		h->cmp_jump_table_idx = KEY_48_BYTES;
+		break;
+	case 64:
+		h->cmp_jump_table_idx = KEY_64_BYTES;
+		break;
+	case 80:
+		h->cmp_jump_table_idx = KEY_80_BYTES;
+		break;
+	case 96:
+		h->cmp_jump_table_idx = KEY_96_BYTES;
+		break;
+	case 112:
+		h->cmp_jump_table_idx = KEY_112_BYTES;
+		break;
+	case 128:
+		h->cmp_jump_table_idx = KEY_128_BYTES;
+		break;
+	default:
+		/* If key is not multiple of 16, use generic memcmp */
+		h->cmp_jump_table_idx = KEY_OTHER_BYTES;
+	}
+#else
+	h->cmp_jump_table_idx = KEY_OTHER_BYTES;
+#endif
 
 	if (hw_trans_mem_support) {
 		h->local_free_slots = rte_zmalloc_socket(NULL,
@@ -353,17 +282,35 @@ rte_hash_create(const struct rte_hash_parameters *params)
 	h->free_slots = r;
 	h->hw_trans_mem_support = hw_trans_mem_support;
 
-	/* populate the free slots ring. Entry zero is reserved for key misses */
+	/* Turn on multi-writer only with explicit flat from user and TM
+	 * support.
+	 */
+	if (params->extra_flag & RTE_HASH_EXTRA_FLAGS_MULTI_WRITER_ADD) {
+		if (h->hw_trans_mem_support) {
+			h->add_key = ADD_KEY_MULTIWRITER_TM;
+		} else {
+			h->add_key = ADD_KEY_MULTIWRITER;
+			h->multiwriter_lock = rte_malloc(NULL,
+							sizeof(rte_spinlock_t),
+							LCORE_CACHE_SIZE);
+			rte_spinlock_init(h->multiwriter_lock);
+		}
+	} else
+		h->add_key = ADD_KEY_SINGLEWRITER;
+
+	/* Populate free slots ring. Entry zero is reserved for key misses. */
 	for (i = 1; i < params->entries + 1; i++)
 		rte_ring_sp_enqueue(r, (void *)((uintptr_t) i));
 
-	rte_rwlock_write_lock(RTE_EAL_TAILQ_RWLOCK);
 	te->data = (void *) h;
 	TAILQ_INSERT_TAIL(hash_list, te, next);
 	rte_rwlock_write_unlock(RTE_EAL_TAILQ_RWLOCK);
 
 	return h;
+err_unlock:
+	rte_rwlock_write_unlock(RTE_EAL_TAILQ_RWLOCK);
 err:
+	rte_ring_free(r);
 	rte_free(te);
 	rte_free(h);
 	rte_free(buckets);
@@ -402,6 +349,8 @@ rte_hash_free(struct rte_hash *h)
 	if (h->hw_trans_mem_support)
 		rte_free(h->local_free_slots);
 
+	if (h->add_key == ADD_KEY_MULTIWRITER)
+		rte_free(h->multiwriter_lock);
 	rte_ring_free(h->free_slots);
 	rte_free(h->key_store);
 	rte_free(h->buckets);
@@ -425,7 +374,7 @@ rte_hash_secondary_hash(const hash_sig_t primary_hash)
 
 	uint32_t tag = primary_hash >> all_bits_shift;
 
-	return (primary_hash ^ ((tag + 1) * alt_bits_xor));
+	return primary_hash ^ ((tag + 1) * alt_bits_xor);
 }
 
 void
@@ -552,6 +501,9 @@ __rte_hash_add_key_with_hash(const struct rte_hash *h, const void *key,
 	unsigned lcore_id;
 	struct lcore_cache *cached_free_slots = NULL;
 
+	if (h->add_key == ADD_KEY_MULTIWRITER)
+		rte_spinlock_lock(h->multiwriter_lock);
+
 	prim_bucket_idx = sig & h->bucket_bitmask;
 	prim_bkt = &h->buckets[prim_bucket_idx];
 	rte_prefetch0(prim_bkt);
@@ -594,7 +546,7 @@ __rte_hash_add_key_with_hash(const struct rte_hash *h, const void *key,
 				prim_bkt->signatures[i].alt == alt_hash) {
 			k = (struct rte_hash_key *) ((char *)keys +
 					prim_bkt->key_idx[i] * h->key_entry_size);
-			if (h->rte_hash_cmp_eq(key, k->key, h->key_len) == 0) {
+			if (rte_hash_cmp_eq(key, k->key, h) == 0) {
 				/* Enqueue index of free slot back in the ring. */
 				enqueue_slot_back(h, cached_free_slots, slot_id);
 				/* Update data */
@@ -603,7 +555,7 @@ __rte_hash_add_key_with_hash(const struct rte_hash *h, const void *key,
 				 * Return index where key is stored,
 				 * substracting the first dummy index
 				 */
-				return (prim_bkt->key_idx[i] - 1);
+				return prim_bkt->key_idx[i] - 1;
 			}
 		}
 	}
@@ -614,7 +566,7 @@ __rte_hash_add_key_with_hash(const struct rte_hash *h, const void *key,
 				sec_bkt->signatures[i].current == alt_hash) {
 			k = (struct rte_hash_key *) ((char *)keys +
 					sec_bkt->key_idx[i] * h->key_entry_size);
-			if (h->rte_hash_cmp_eq(key, k->key, h->key_len) == 0) {
+			if (rte_hash_cmp_eq(key, k->key, h) == 0) {
 				/* Enqueue index of free slot back in the ring. */
 				enqueue_slot_back(h, cached_free_slots, slot_id);
 				/* Update data */
@@ -623,7 +575,7 @@ __rte_hash_add_key_with_hash(const struct rte_hash *h, const void *key,
 				 * Return index where key is stored,
 				 * substracting the first dummy index
 				 */
-				return (sec_bkt->key_idx[i] - 1);
+				return sec_bkt->key_idx[i] - 1;
 			}
 		}
 	}
@@ -632,35 +584,67 @@ __rte_hash_add_key_with_hash(const struct rte_hash *h, const void *key,
 	rte_memcpy(new_k->key, key, h->key_len);
 	new_k->pdata = data;
 
-	/* Insert new entry is there is room in the primary bucket */
-	for (i = 0; i < RTE_HASH_BUCKET_ENTRIES; i++) {
-		/* Check if slot is available */
-		if (likely(prim_bkt->signatures[i].sig == NULL_SIGNATURE)) {
-			prim_bkt->signatures[i].current = sig;
-			prim_bkt->signatures[i].alt = alt_hash;
-			prim_bkt->key_idx[i] = new_idx;
+#if defined(RTE_ARCH_X86) /* currently only x86 support HTM */
+	if (h->add_key == ADD_KEY_MULTIWRITER_TM) {
+		ret = rte_hash_cuckoo_insert_mw_tm(prim_bkt,
+				sig, alt_hash, new_idx);
+		if (ret >= 0)
+			return new_idx - 1;
+
+		/* Primary bucket full, need to make space for new entry */
+		ret = rte_hash_cuckoo_make_space_mw_tm(h, prim_bkt, sig,
+							alt_hash, new_idx);
+
+		if (ret >= 0)
+			return new_idx - 1;
+
+		/* Also search secondary bucket to get better occupancy */
+		ret = rte_hash_cuckoo_make_space_mw_tm(h, sec_bkt, sig,
+							alt_hash, new_idx);
+
+		if (ret >= 0)
+			return new_idx - 1;
+	} else {
+#endif
+		for (i = 0; i < RTE_HASH_BUCKET_ENTRIES; i++) {
+			/* Check if slot is available */
+			if (likely(prim_bkt->signatures[i].sig == NULL_SIGNATURE)) {
+				prim_bkt->signatures[i].current = sig;
+				prim_bkt->signatures[i].alt = alt_hash;
+				prim_bkt->key_idx[i] = new_idx;
+				break;
+			}
+		}
+
+		if (i != RTE_HASH_BUCKET_ENTRIES) {
+			if (h->add_key == ADD_KEY_MULTIWRITER)
+				rte_spinlock_unlock(h->multiwriter_lock);
 			return new_idx - 1;
 		}
-	}
 
-	/* Primary bucket is full, so we need to make space for new entry */
-	ret = make_space_bucket(h, prim_bkt);
-	/*
-	 * After recursive function.
-	 * Insert the new entry in the position of the pushed entry
-	 * if successful or return error and
-	 * store the new slot back in the ring
-	 */
-	if (ret >= 0) {
-		prim_bkt->signatures[ret].current = sig;
-		prim_bkt->signatures[ret].alt = alt_hash;
-		prim_bkt->key_idx[ret] = new_idx;
-		return (new_idx - 1);
+		/* Primary bucket full, need to make space for new entry
+		 * After recursive function.
+		 * Insert the new entry in the position of the pushed entry
+		 * if successful or return error and
+		 * store the new slot back in the ring
+		 */
+		ret = make_space_bucket(h, prim_bkt);
+		if (ret >= 0) {
+			prim_bkt->signatures[ret].current = sig;
+			prim_bkt->signatures[ret].alt = alt_hash;
+			prim_bkt->key_idx[ret] = new_idx;
+			if (h->add_key == ADD_KEY_MULTIWRITER)
+				rte_spinlock_unlock(h->multiwriter_lock);
+			return new_idx - 1;
+		}
+#if defined(RTE_ARCH_X86)
 	}
-
+#endif
 	/* Error in addition, store new slot back in the ring and return error */
 	enqueue_slot_back(h, cached_free_slots, (void *)((uintptr_t) new_idx));
 
+	if (h->add_key == ADD_KEY_MULTIWRITER)
+		rte_spinlock_unlock(h->multiwriter_lock);
 	return ret;
 }
 
@@ -725,14 +709,14 @@ __rte_hash_lookup_with_hash(const struct rte_hash *h, const void *key,
 				bkt->signatures[i].sig != NULL_SIGNATURE) {
 			k = (struct rte_hash_key *) ((char *)keys +
 					bkt->key_idx[i] * h->key_entry_size);
-			if (h->rte_hash_cmp_eq(key, k->key, h->key_len) == 0) {
+			if (rte_hash_cmp_eq(key, k->key, h) == 0) {
 				if (data != NULL)
 					*data = k->pdata;
 				/*
 				 * Return index where key is stored,
 				 * substracting the first dummy index
 				 */
-				return (bkt->key_idx[i] - 1);
+				return bkt->key_idx[i] - 1;
 			}
 		}
 	}
@@ -748,14 +732,14 @@ __rte_hash_lookup_with_hash(const struct rte_hash *h, const void *key,
 				bkt->signatures[i].alt == sig) {
 			k = (struct rte_hash_key *) ((char *)keys +
 					bkt->key_idx[i] * h->key_entry_size);
-			if (h->rte_hash_cmp_eq(key, k->key, h->key_len) == 0) {
+			if (rte_hash_cmp_eq(key, k->key, h) == 0) {
 				if (data != NULL)
 					*data = k->pdata;
 				/*
 				 * Return index where key is stored,
 				 * substracting the first dummy index
 				 */
-				return (bkt->key_idx[i] - 1);
+				return bkt->key_idx[i] - 1;
 			}
 		}
 	}
@@ -840,14 +824,14 @@ __rte_hash_del_key_with_hash(const struct rte_hash *h, const void *key,
 				bkt->signatures[i].sig != NULL_SIGNATURE) {
 			k = (struct rte_hash_key *) ((char *)keys +
 					bkt->key_idx[i] * h->key_entry_size);
-			if (h->rte_hash_cmp_eq(key, k->key, h->key_len) == 0) {
+			if (rte_hash_cmp_eq(key, k->key, h) == 0) {
 				remove_entry(h, bkt, i);
 
 				/*
 				 * Return index where key is stored,
 				 * substracting the first dummy index
 				 */
-				return (bkt->key_idx[i] - 1);
+				return bkt->key_idx[i] - 1;
 			}
 		}
 	}
@@ -863,14 +847,14 @@ __rte_hash_del_key_with_hash(const struct rte_hash *h, const void *key,
 				bkt->signatures[i].sig != NULL_SIGNATURE) {
 			k = (struct rte_hash_key *) ((char *)keys +
 					bkt->key_idx[i] * h->key_entry_size);
-			if (h->rte_hash_cmp_eq(key, k->key, h->key_len) == 0) {
+			if (rte_hash_cmp_eq(key, k->key, h) == 0) {
 				remove_entry(h, bkt, i);
 
 				/*
 				 * Return index where key is stored,
 				 * substracting the first dummy index
 				 */
-				return (bkt->key_idx[i] - 1);
+				return bkt->key_idx[i] - 1;
 			}
 		}
 	}
@@ -891,6 +875,26 @@ rte_hash_del_key(const struct rte_hash *h, const void *key)
 {
 	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
 	return __rte_hash_del_key_with_hash(h, key, rte_hash_hash(h, key));
+}
+
+int
+rte_hash_get_key_with_position(const struct rte_hash *h, const int32_t position,
+			       void **key)
+{
+	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
+
+	struct rte_hash_key *k, *keys = h->key_store;
+	k = (struct rte_hash_key *) ((char *) keys + (position + 1) *
+				     h->key_entry_size);
+	*key = k->key;
+
+	if (position !=
+	    __rte_hash_lookup_with_hash(h, *key, rte_hash_hash(h, *key),
+					NULL)) {
+		return -ENOENT;
+	}
+
+	return 0;
 }
 
 /* Lookup bulk stage 0: Prefetch input key */
@@ -980,7 +984,7 @@ lookup_stage3(unsigned idx, const struct rte_hash_key *key_slot, const void * co
 	unsigned hit;
 	unsigned key_idx;
 
-	hit = !h->rte_hash_cmp_eq(key_slot->key, keys[idx], h->key_len);
+	hit = !rte_hash_cmp_eq(key_slot->key, keys[idx], h);
 	if (data != NULL)
 		data[idx] = key_slot->pdata;
 
@@ -1239,5 +1243,5 @@ rte_hash_iterate(const struct rte_hash *h, const void **key, void **data, uint32
 	/* Increment iterator */
 	(*next)++;
 
-	return (position - 1);
+	return position - 1;
 }

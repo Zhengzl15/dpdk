@@ -49,7 +49,6 @@
 #include <rte_string_fns.h>
 #include <rte_errno.h>
 #include <rte_ring.h>
-#include <rte_mempool.h>
 #include <rte_malloc.h>
 #include <rte_common.h>
 #include <rte_ivshmem.h>
@@ -109,8 +108,8 @@ TAILQ_HEAD(rte_ring_list, rte_tailq_entry);
 static int
 is_ivshmem_device(struct rte_pci_device * dev)
 {
-	return (dev->id.vendor_id == PCI_VENDOR_ID_IVSHMEM
-			&& dev->id.device_id == PCI_DEVICE_ID_IVSHMEM);
+	return dev->id.vendor_id == PCI_VENDOR_ID_IVSHMEM
+			&& dev->id.device_id == PCI_DEVICE_ID_IVSHMEM;
 }
 
 static void *
@@ -254,17 +253,14 @@ adjacent(const struct rte_memzone * mz1, const struct rte_memzone * mz2)
 static int
 has_adjacent_segments(struct ivshmem_segment * ms, int len)
 {
-	int i, j, a;
+	int i, j;
 
 	for (i = 0; i < len; i++)
 		for (j = i + 1; j < len; j++) {
-			a = adjacent(&ms[i].entry.mz, &ms[j].entry.mz);
-
-			/* check if segments are adjacent virtually and/or physically but
-			 * not ioremap (since that would indicate that they are from
-			 * different PCI devices and thus don't need to be concatenated.
+			/* we're only interested in fully adjacent segments; partially
+			 * adjacent segments can coexist.
 			 */
-			if ((a & (VIRT|PHYS)) > 0 && (a & IOREMAP) == 0)
+			if (adjacent(&ms[i].entry.mz, &ms[j].entry.mz) == FULL)
 				return 1;
 		}
 	return 0;

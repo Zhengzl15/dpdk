@@ -1,6 +1,6 @@
 #   BSD LICENSE
 #
-#   Copyright(c) 2010-2014 Intel Corporation. All rights reserved.
+#   Copyright(c) 2010-2016 Intel Corporation. All rights reserved.
 #   All rights reserved.
 #
 #   Redistribution and use in source and binary forms, with or without
@@ -35,13 +35,16 @@ include $(RTE_SDK)/mk/rte.vars.mk
 # library name
 #
 LIB = librte_port.a
+ifeq ($(CONFIG_RTE_PORT_PCAP),y)
+LDLIBS += -lpcap
+endif
 
 CFLAGS += -O3
 CFLAGS += $(WERROR_FLAGS)
 
 EXPORT_MAP := rte_port_version.map
 
-LIBABIVER := 2
+LIBABIVER := 3
 
 #
 # all source are stored in SRCS-y
@@ -53,6 +56,9 @@ SRCS-$(CONFIG_RTE_LIBRTE_PORT) += rte_port_frag.c
 SRCS-$(CONFIG_RTE_LIBRTE_PORT) += rte_port_ras.c
 endif
 SRCS-$(CONFIG_RTE_LIBRTE_PORT) += rte_port_sched.c
+ifeq ($(CONFIG_RTE_LIBRTE_KNI),y)
+SRCS-$(CONFIG_RTE_LIBRTE_PORT) += rte_port_kni.c
+endif
 SRCS-$(CONFIG_RTE_LIBRTE_PORT) += rte_port_source_sink.c
 
 # install includes
@@ -64,6 +70,9 @@ SYMLINK-$(CONFIG_RTE_LIBRTE_PORT)-include += rte_port_frag.h
 SYMLINK-$(CONFIG_RTE_LIBRTE_PORT)-include += rte_port_ras.h
 endif
 SYMLINK-$(CONFIG_RTE_LIBRTE_PORT)-include += rte_port_sched.h
+ifeq ($(CONFIG_RTE_LIBRTE_KNI),y)
+SYMLINK-$(CONFIG_RTE_LIBRTE_PORT)-include += rte_port_kni.h
+endif
 SYMLINK-$(CONFIG_RTE_LIBRTE_PORT)-include += rte_port_source_sink.h
 
 # this lib depends upon:
@@ -72,5 +81,9 @@ DEPDIRS-$(CONFIG_RTE_LIBRTE_PORT) += lib/librte_mbuf
 DEPDIRS-$(CONFIG_RTE_LIBRTE_PORT) += lib/librte_mempool
 DEPDIRS-$(CONFIG_RTE_LIBRTE_PORT) += lib/librte_ether
 DEPDIRS-$(CONFIG_RTE_LIBRTE_PORT) += lib/librte_ip_frag
+DEPDIRS-$(CONFIG_RTE_LIBRTE_PORT) += lib/librte_sched
+ifeq ($(CONFIG_RTE_LIBRTE_KNI),y)
+DEPDIRS-$(CONFIG_RTE_LIBRTE_PORT) += lib/librte_kni
+endif
 
 include $(RTE_SDK)/mk/rte.lib.mk

@@ -1,7 +1,7 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright(c) 2010-2015 Intel Corporation. All rights reserved.
+ *   Copyright(c) 2010-2016 Intel Corporation. All rights reserved.
  *   All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
@@ -40,6 +40,9 @@
 #include <rte_port_ras.h>
 #include <rte_port_sched.h>
 #include <rte_port_source_sink.h>
+#ifdef RTE_LIBRTE_KNI
+#include <rte_port_kni.h>
+#endif
 #include <rte_pipeline.h>
 
 enum pipeline_port_in_type {
@@ -49,6 +52,7 @@ enum pipeline_port_in_type {
 	PIPELINE_PORT_IN_RING_READER_IPV4_FRAG,
 	PIPELINE_PORT_IN_RING_READER_IPV6_FRAG,
 	PIPELINE_PORT_IN_SCHED_READER,
+	PIPELINE_PORT_IN_KNI_READER,
 	PIPELINE_PORT_IN_SOURCE,
 };
 
@@ -61,6 +65,9 @@ struct pipeline_port_in_params {
 		struct rte_port_ring_reader_ipv4_frag_params ring_ipv4_frag;
 		struct rte_port_ring_reader_ipv6_frag_params ring_ipv6_frag;
 		struct rte_port_sched_reader_params sched;
+#ifdef RTE_LIBRTE_KNI
+		struct rte_port_kni_reader_params kni;
+#endif
 		struct rte_port_source_params source;
 	} params;
 	uint32_t burst_size;
@@ -82,6 +89,10 @@ pipeline_port_in_params_convert(struct pipeline_port_in_params  *p)
 		return (void *) &p->params.ring_ipv6_frag;
 	case PIPELINE_PORT_IN_SCHED_READER:
 		return (void *) &p->params.sched;
+#ifdef RTE_LIBRTE_KNI
+	case PIPELINE_PORT_IN_KNI_READER:
+		return (void *) &p->params.kni;
+#endif
 	case PIPELINE_PORT_IN_SOURCE:
 		return (void *) &p->params.source;
 	default:
@@ -105,6 +116,10 @@ pipeline_port_in_params_get_ops(struct pipeline_port_in_params  *p)
 		return &rte_port_ring_reader_ipv6_frag_ops;
 	case PIPELINE_PORT_IN_SCHED_READER:
 		return &rte_port_sched_reader_ops;
+#ifdef RTE_LIBRTE_KNI
+	case PIPELINE_PORT_IN_KNI_READER:
+		return &rte_port_kni_reader_ops;
+#endif
 	case PIPELINE_PORT_IN_SOURCE:
 		return &rte_port_source_ops;
 	default:
@@ -122,6 +137,8 @@ enum pipeline_port_out_type {
 	PIPELINE_PORT_OUT_RING_WRITER_IPV4_RAS,
 	PIPELINE_PORT_OUT_RING_WRITER_IPV6_RAS,
 	PIPELINE_PORT_OUT_SCHED_WRITER,
+	PIPELINE_PORT_OUT_KNI_WRITER,
+	PIPELINE_PORT_OUT_KNI_WRITER_NODROP,
 	PIPELINE_PORT_OUT_SINK,
 };
 
@@ -137,6 +154,11 @@ struct pipeline_port_out_params {
 		struct rte_port_ring_writer_ipv4_ras_params ring_ipv4_ras;
 		struct rte_port_ring_writer_ipv6_ras_params ring_ipv6_ras;
 		struct rte_port_sched_writer_params sched;
+#ifdef RTE_LIBRTE_KNI
+		struct rte_port_kni_writer_params kni;
+		struct rte_port_kni_writer_nodrop_params kni_nodrop;
+#endif
+		struct rte_port_sink_params sink;
 	} params;
 };
 
@@ -162,7 +184,14 @@ pipeline_port_out_params_convert(struct pipeline_port_out_params  *p)
 		return (void *) &p->params.ring_ipv6_ras;
 	case PIPELINE_PORT_OUT_SCHED_WRITER:
 		return (void *) &p->params.sched;
+#ifdef RTE_LIBRTE_KNI
+	case PIPELINE_PORT_OUT_KNI_WRITER:
+		return (void *) &p->params.kni;
+	case PIPELINE_PORT_OUT_KNI_WRITER_NODROP:
+		return (void *) &p->params.kni_nodrop;
+#endif
 	case PIPELINE_PORT_OUT_SINK:
+		return (void *) &p->params.sink;
 	default:
 		return NULL;
 	}
@@ -190,6 +219,12 @@ pipeline_port_out_params_get_ops(struct pipeline_port_out_params  *p)
 		return &rte_port_ring_writer_ipv6_ras_ops;
 	case PIPELINE_PORT_OUT_SCHED_WRITER:
 		return &rte_port_sched_writer_ops;
+#ifdef RTE_LIBRTE_KNI
+	case PIPELINE_PORT_OUT_KNI_WRITER:
+		return &rte_port_kni_writer_ops;
+	case PIPELINE_PORT_OUT_KNI_WRITER_NODROP:
+		return &rte_port_kni_writer_nodrop_ops;
+#endif
 	case PIPELINE_PORT_OUT_SINK:
 		return &rte_port_sink_ops;
 	default:
@@ -198,15 +233,19 @@ pipeline_port_out_params_get_ops(struct pipeline_port_out_params  *p)
 }
 
 #ifndef PIPELINE_NAME_SIZE
-#define PIPELINE_NAME_SIZE                       32
+#define PIPELINE_NAME_SIZE                       64
+#endif
+
+#ifndef PIPELINE_TYPE_SIZE
+#define PIPELINE_TYPE_SIZE                       64
 #endif
 
 #ifndef PIPELINE_MAX_PORT_IN
-#define PIPELINE_MAX_PORT_IN                     16
+#define PIPELINE_MAX_PORT_IN                     64
 #endif
 
 #ifndef PIPELINE_MAX_PORT_OUT
-#define PIPELINE_MAX_PORT_OUT                    16
+#define PIPELINE_MAX_PORT_OUT                    64
 #endif
 
 #ifndef PIPELINE_MAX_TABLES
@@ -222,11 +261,12 @@ pipeline_port_out_params_get_ops(struct pipeline_port_out_params  *p)
 #endif
 
 #ifndef PIPELINE_MAX_ARGS
-#define PIPELINE_MAX_ARGS                        32
+#define PIPELINE_MAX_ARGS                        64
 #endif
 
 struct pipeline_params {
 	char name[PIPELINE_NAME_SIZE];
+	char type[PIPELINE_TYPE_SIZE];
 
 	struct pipeline_port_in_params port_in[PIPELINE_MAX_PORT_IN];
 	struct pipeline_port_out_params port_out[PIPELINE_MAX_PORT_OUT];
@@ -259,20 +299,40 @@ typedef int (*pipeline_be_op_run)(void *pipeline);
 
 typedef int (*pipeline_be_op_timer)(void *pipeline);
 
-typedef int (*pipeline_be_op_track)(void *pipeline,
-	uint32_t port_in,
-	uint32_t *port_out);
-
 struct pipeline_be_ops {
 	pipeline_be_op_init f_init;
 	pipeline_be_op_free f_free;
 	pipeline_be_op_run f_run;
 	pipeline_be_op_timer f_timer;
-	pipeline_be_op_track f_track;
 };
 
-/* Parse hex string to uint8_t array */
-int
-parse_hex_string(char *src, uint8_t *dst, uint32_t *size);
+/* Pipeline specific config parse error messages */
+#define PIPELINE_ARG_CHECK(exp, fmt, ...)				\
+do {									\
+	if (!(exp)) {							\
+		fprintf(stderr, fmt "\n", ## __VA_ARGS__);		\
+		return -1;						\
+	}								\
+} while (0)
+
+#define PIPELINE_PARSE_ERR_INV_VAL(exp, section, entry, val)		\
+PIPELINE_ARG_CHECK(exp, "Parse error in section \"%s\": entry \"%s\" "	\
+	"has invalid value (\"%s\")", section, entry, val)
+
+#define PIPELINE_PARSE_ERR_OUT_RNG(exp, section, entry, val)		\
+PIPELINE_ARG_CHECK(exp, "Parse error in section \"%s\": entry \"%s\" "	\
+	"value is out of range (\"%s\")", section, entry, val)
+
+#define PIPELINE_PARSE_ERR_DUPLICATE(exp, section, entry)		\
+PIPELINE_ARG_CHECK(exp, "Parse error in section \"%s\": duplicated "	\
+	"entry \"%s\"", section, entry)
+
+#define PIPELINE_PARSE_ERR_INV_ENT(exp, section, entry)			\
+PIPELINE_ARG_CHECK(exp, "Parse error in section \"%s\": invalid entry "	\
+	"\"%s\"", section, entry)
+
+#define PIPELINE_PARSE_ERR_MANDATORY(exp, section, entry)		\
+PIPELINE_ARG_CHECK(exp, "Parse error in section \"%s\": mandatory "	\
+	"entry \"%s\" is missing", section, entry)
 
 #endif

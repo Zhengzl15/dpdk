@@ -169,9 +169,12 @@ struct bond_dev_private {
 
 	struct rte_kvargs *kvlist;
 	uint8_t slave_update_idx;
+
+	uint32_t candidate_max_rx_pktlen;
+	uint32_t max_rx_pktlen;
 };
 
-extern struct eth_dev_ops default_dev_ops;
+extern const struct eth_dev_ops default_dev_ops;
 
 int
 check_for_bonded_ethdev(const struct rte_eth_dev *eth_dev);

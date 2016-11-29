@@ -511,10 +511,14 @@ test_attach_from_different_pool(void)
 	rte_pktmbuf_detach(clone);
 	if (c_data != rte_pktmbuf_mtod(clone, char *))
 		GOTO_FAIL("clone was not detached properly\n");
+	if (rte_mbuf_refcnt_read(m) != 2)
+		GOTO_FAIL("invalid refcnt in m\n");
 
 	rte_pktmbuf_detach(clone2);
 	if (c_data2 != rte_pktmbuf_mtod(clone2, char *))
 		GOTO_FAIL("clone2 was not detached properly\n");
+	if (rte_mbuf_refcnt_read(m) != 1)
+		GOTO_FAIL("invalid refcnt in m\n");
 
 	/* free the clones and the initial mbuf */
 	rte_pktmbuf_free(clone2);
@@ -696,7 +700,7 @@ test_refcnt_slave(__attribute__((unused)) void *arg)
 	printf("%s finished at lcore %u, "
 	       "number of freed mbufs: %u\n",
 	       __func__, lcore, free);
-	return (0);
+	return 0;
 }
 
 static void
@@ -713,7 +717,7 @@ test_refcnt_iter(unsigned lcore, unsigned iter)
 	 * - increment it's reference up to N+1,
 	 * - enqueue it N times into the ring for slave cores to free.
 	 */
-	for (i = 0, n = rte_mempool_count(refcnt_pool);
+	for (i = 0, n = rte_mempool_avail_count(refcnt_pool);
 	    i != n && (m = rte_pktmbuf_alloc(refcnt_pool)) != NULL;
 	    i++) {
 		ref = RTE_MAX(rte_rand() % REFCNT_MAX_REF, 1UL);
@@ -741,14 +745,14 @@ test_refcnt_iter(unsigned lcore, unsigned iter)
 
 	/* check that all mbufs are back into mempool by now */
 	for (wn = 0; wn != REFCNT_MAX_TIMEOUT; wn++) {
-		if ((i = rte_mempool_count(refcnt_pool)) == n) {
+		if ((i = rte_mempool_avail_count(refcnt_pool)) == n) {
 			refcnt_lcore[lcore] += tref;
 			printf("%s(lcore=%u, iter=%u) completed, "
 			    "%u references processed\n",
 			    __func__, lcore, iter, tref);
 			return;
 		}
-		rte_delay_ms(1000);
+		rte_delay_ms(100);
 	}
 
 	rte_panic("(lcore=%u, iter=%u): after %us only "
@@ -770,7 +774,7 @@ test_refcnt_master(void)
 	rte_wmb();
 
 	printf("%s finished at lcore %u\n", __func__, lcore);
-	return (0);
+	return 0;
 }
 
 #endif
@@ -786,7 +790,7 @@ test_refcnt_mbuf(void)
 	if ((lnum = rte_lcore_count()) == 1) {
 		printf("skipping %s, number of lcores: %u is not enough\n",
 		    __func__, lnum);
-		return (0);
+		return 0;
 	}
 
 	printf("starting %s, at %u lcores\n", __func__, lnum);
@@ -800,16 +804,16 @@ test_refcnt_mbuf(void)
 				SOCKET_ID_ANY)) == NULL) {
 		printf("%s: cannot allocate " MAKE_STRING(refcnt_pool) "\n",
 		    __func__);
-		return (-1);
+		return -1;
 	}
 
 	if (refcnt_mbuf_ring == NULL &&
 			(refcnt_mbuf_ring = rte_ring_create("refcnt_mbuf_ring",
-			REFCNT_RING_SIZE, SOCKET_ID_ANY,
+			rte_align32pow2(REFCNT_RING_SIZE), SOCKET_ID_ANY,
 			RING_F_SP_ENQ)) == NULL) {
 		printf("%s: cannot allocate " MAKE_STRING(refcnt_mbuf_ring)
 		    "\n", __func__);
-		return (-1);
+		return -1;
 	}
 
 	refcnt_stop_slaves = 0;
@@ -836,7 +840,7 @@ test_refcnt_mbuf(void)
 	rte_ring_dump(stdout, refcnt_mbuf_ring);
 
 #endif
-	return (0);
+	return 0;
 }
 
 #include <unistd.h>
@@ -930,7 +934,7 @@ test_failing_mbuf_sanity_check(void)
 static int
 test_mbuf(void)
 {
-	RTE_BUILD_BUG_ON(sizeof(struct rte_mbuf) != RTE_CACHE_LINE_SIZE * 2);
+	RTE_BUILD_BUG_ON(sizeof(struct rte_mbuf) != RTE_CACHE_LINE_MIN_SIZE * 2);
 
 	/* create pktmbuf pool if it does not exist */
 	if (pktmbuf_pool == NULL) {
@@ -1022,8 +1026,4 @@ test_mbuf(void)
 	return 0;
 }
 
-static struct test_command mbuf_cmd = {
-	.command = "mbuf_autotest",
-	.callback = test_mbuf,
-};
-REGISTER_TEST_COMMAND(mbuf_cmd);
+REGISTER_TEST_COMMAND(mbuf_autotest, test_mbuf);

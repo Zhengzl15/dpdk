@@ -1,7 +1,7 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright(c) 2010-2014 Intel Corporation. All rights reserved.
+ *   Copyright(c) 2010-2016 Intel Corporation. All rights reserved.
  *   Copyright(c) 2012-2014 6WIND S.A.
  *   All rights reserved.
  *
@@ -49,7 +49,8 @@
 #include <errno.h>
 #include <sys/mman.h>
 #include <sys/queue.h>
-#if defined(RTE_ARCH_X86_64) || defined(RTE_ARCH_I686)
+#include <sys/stat.h>
+#if defined(RTE_ARCH_X86)
 #include <sys/io.h>
 #endif
 
@@ -81,6 +82,7 @@
 #include "eal_filesystem.h"
 #include "eal_hugepages.h"
 #include "eal_options.h"
+#include "eal_vfio.h"
 
 #define MEMSIZE_IF_NO_HUGE_PAGE (64ULL * 1024ULL * 1024ULL)
 
@@ -464,24 +466,6 @@ eal_parse_vfio_intr(const char *mode)
 	return -1;
 }
 
-static inline size_t
-eal_get_hugepage_mem_size(void)
-{
-	uint64_t size = 0;
-	unsigned i, j;
-
-	for (i = 0; i < internal_config.num_hugepage_sizes; i++) {
-		struct hugepage_info *hpi = &internal_config.hugepage_info[i];
-		if (hpi->hugedir != NULL) {
-			for (j = 0; j < RTE_MAX_NUMA_NODES; j++) {
-				size += hpi->hugepage_sz * hpi->num_pages[j];
-			}
-		}
-	}
-
-	return (size < SIZE_MAX) ? (size_t)(size) : SIZE_MAX;
-}
-
 /* Parse the arguments for --log-level only */
 static void
 eal_log_level_parse(int argc, char **argv)
@@ -711,14 +695,39 @@ rte_eal_mcfg_complete(void)
 int
 rte_eal_iopl_init(void)
 {
-#if defined(RTE_ARCH_X86_64) || defined(RTE_ARCH_I686)
+#if defined(RTE_ARCH_X86)
 	if (iopl(3) != 0)
 		return -1;
-	return 0;
-#else
-	return -1;
 #endif
+	return 0;
 }
+
+#ifdef VFIO_PRESENT
+static int rte_eal_vfio_setup(void)
+{
+	int vfio_enabled = 0;
+
+	if (!internal_config.no_pci) {
+		pci_vfio_enable();
+		vfio_enabled |= pci_vfio_is_enabled();
+	}
+
+	if (vfio_enabled) {
+
+		/* if we are primary process, create a thread to communicate with
+		 * secondary processes. the thread will use a socket to wait for
+		 * requests from secondary process to send open file descriptors,
+		 * because VFIO does not allow multiple open descriptors on a group or
+		 * VFIO container.
+		 */
+		if (internal_config.process_type == RTE_PROC_PRIMARY &&
+				vfio_mp_sync_setup() < 0)
+			return -1;
+	}
+
+	return 0;
+}
+#endif
 
 /* Launch threads, called at application init(). */
 int
@@ -763,8 +772,6 @@ rte_eal_init(int argc, char **argv)
 	if (internal_config.memory == 0 && internal_config.force_sockets == 0) {
 		if (internal_config.no_hugetlbfs)
 			internal_config.memory = MEMSIZE_IF_NO_HUGE_PAGE;
-		else
-			internal_config.memory = eal_get_hugepage_mem_size();
 	}
 
 	if (internal_config.vmware_tsc_map == 1) {
@@ -784,6 +791,11 @@ rte_eal_init(int argc, char **argv)
 
 	if (rte_eal_pci_init() < 0)
 		rte_panic("Cannot init PCI\n");
+
+#ifdef VFIO_PRESENT
+	if (rte_eal_vfio_setup() < 0)
+		rte_panic("Cannot init VFIO\n");
+#endif
 
 #ifdef RTE_LIBRTE_IVSHMEM
 	if (rte_eal_ivshmem_init() < 0)
@@ -817,8 +829,6 @@ rte_eal_init(int argc, char **argv)
 		rte_panic("Cannot init HPET or TSC timers\n");
 
 	eal_check_mem_on_local_socket();
-
-	rte_eal_mcfg_complete();
 
 	if (eal_plugins_init() < 0)
 		rte_panic("Cannot init plugins\n");
@@ -862,7 +872,7 @@ rte_eal_init(int argc, char **argv)
 		ret = rte_thread_setname(lcore_config[i].thread_id,
 						thread_name);
 		if (ret != 0)
-			RTE_LOG(ERR, EAL,
+			RTE_LOG(DEBUG, EAL,
 				"Cannot set name for lcore thread\n");
 	}
 
@@ -876,6 +886,8 @@ rte_eal_init(int argc, char **argv)
 	/* Probe & Initialize PCI devices */
 	if (rte_eal_pci_probe())
 		rte_panic("Cannot probe PCI\n");
+
+	rte_eal_mcfg_complete();
 
 	return fctret;
 }
@@ -901,27 +913,33 @@ int rte_eal_has_hugepages(void)
 int
 rte_eal_check_module(const char *module_name)
 {
-	char mod_name[30]; /* Any module names can be longer than 30 bytes? */
-	int ret = 0;
+	char sysfs_mod_name[PATH_MAX];
+	struct stat st;
 	int n;
 
 	if (NULL == module_name)
 		return -1;
 
-	FILE *fd = fopen("/proc/modules", "r");
-	if (NULL == fd) {
-		RTE_LOG(ERR, EAL, "Open /proc/modules failed!"
-			" error %i (%s)\n", errno, strerror(errno));
+	/* Check if there is sysfs mounted */
+	if (stat("/sys/module", &st) != 0) {
+		RTE_LOG(DEBUG, EAL, "sysfs is not mounted! error %i (%s)\n",
+			errno, strerror(errno));
 		return -1;
 	}
-	while (!feof(fd)) {
-		n = fscanf(fd, "%29s %*[^\n]", mod_name);
-		if ((n == 1) && !strcmp(mod_name, module_name)) {
-			ret = 1;
-			break;
-		}
-	}
-	fclose(fd);
 
-	return ret;
+	/* A module might be built-in, therefore try sysfs */
+	n = snprintf(sysfs_mod_name, PATH_MAX, "/sys/module/%s", module_name);
+	if (n < 0 || n > PATH_MAX) {
+		RTE_LOG(DEBUG, EAL, "Could not format module path\n");
+		return -1;
+	}
+
+	if (stat(sysfs_mod_name, &st) != 0) {
+		RTE_LOG(DEBUG, EAL, "Module %s not found! error %i (%s)\n",
+		        sysfs_mod_name, errno, strerror(errno));
+		return 0;
+	}
+
+	/* Module has been found */
+	return 1;
 }

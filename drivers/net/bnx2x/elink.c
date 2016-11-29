@@ -1234,7 +1234,7 @@ static uint8_t elink_is_4_port_mode(struct bnx2x_softc *sc)
 	port4mode_ovwr_val = REG_RD(sc, MISC_REG_PORT4MODE_EN_OVWR);
 	if (port4mode_ovwr_val & (1 << 0)) {
 		/* Return 4-port mode override value */
-		return ((port4mode_ovwr_val & (1 << 1)) == (1 << 1));
+		return (port4mode_ovwr_val & (1 << 1)) == (1 << 1);
 	}
 	/* Return 4-port mode from input pin */
 	return (uint8_t) REG_RD(sc, MISC_REG_PORT4MODE_EN);
@@ -5029,7 +5029,7 @@ static elink_status_t elink_direct_parallel_detect_used(struct elink_phy *phy,
 	if (status2_1000x & MDIO_SERDES_DIGITAL_A_1000X_STATUS2_AN_DISABLED) {
 		PMD_DRV_LOG(DEBUG, "1G parallel detect link on port %d",
 			    params->port);
-		return 1;
+		return ELINK_STATUS_ERROR;
 	}
 
 	CL22_RD_OVER_CL45(sc, phy,
@@ -5039,7 +5039,7 @@ static elink_status_t elink_direct_parallel_detect_used(struct elink_phy *phy,
 	if (pd_10g & MDIO_10G_PARALLEL_DETECT_PAR_DET_10G_STATUS_PD_LINK) {
 		PMD_DRV_LOG(DEBUG, "10G parallel detect link on port %d",
 			    params->port);
-		return 1;
+		return ELINK_STATUS_ERROR;
 	}
 	return ELINK_STATUS_OK;
 }
@@ -6312,7 +6312,7 @@ elink_status_t elink_link_update(struct elink_params * params,
 	for (phy_index = ELINK_INT_PHY; phy_index < params->num_phys;
 	     phy_index++) {
 		phy_vars[phy_index].flow_ctrl = 0;
-		phy_vars[phy_index].link_status = 0;
+		phy_vars[phy_index].link_status = ETH_LINK_DOWN;
 		phy_vars[phy_index].line_speed = 0;
 		phy_vars[phy_index].duplex = DUPLEX_FULL;
 		phy_vars[phy_index].phy_link_up = 0;
@@ -6735,7 +6735,7 @@ static elink_status_t elink_8073_is_snr_needed(struct bnx2x_softc *sc,
 	if (val != 0x102)
 		return ELINK_STATUS_OK;
 
-	return 1;
+	return ELINK_STATUS_ERROR;
 }
 
 static elink_status_t elink_8073_xaui_wa(struct bnx2x_softc *sc,
@@ -7557,7 +7557,7 @@ static elink_status_t elink_read_sfp_module_eeprom(struct elink_phy *phy,
 						   uint16_t byte_cnt,
 						   uint8_t * o_buf)
 {
-	elink_status_t rc = 0;
+	elink_status_t rc = ELINK_STATUS_OK;
 	uint8_t xfer_size;
 	uint8_t *user_data = o_buf;
 	read_sfp_module_eeprom_func_p read_func;

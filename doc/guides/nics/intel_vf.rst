@@ -151,7 +151,7 @@ For example,
 
         modprobe uio
         insmod igb_uio
-        ./dpdk_nic_bind.py -b igb_uio bb:ss.f
+        ./dpdk-devbind.py -b igb_uio bb:ss.f
         echo 2 > /sys/bus/pci/devices/0000\:bb\:ss.f/max_vfs (To enable two VFs on a specific PCI device)
 
     Launch the DPDK testpmd/example or your own host daemon application using the DPDK PMD library.
@@ -236,7 +236,7 @@ For example,
 
         modprobe uio
         insmod igb_uio
-        ./dpdk_nic_bind.py -b igb_uio bb:ss.f
+        ./dpdk-devbind.py -b igb_uio bb:ss.f
         echo 2 > /sys/bus/pci/devices/0000\:bb\:ss.f/max_vfs (To enable two VFs on a specific PCI device)
 
     Launch the DPDK testpmd/example or your own host daemon application using the DPDK PMD library.
@@ -278,14 +278,14 @@ For example,
         rmmod igb (To remove the igb module)
         insmod igb max_vfs=2,2 (To enable two Virtual Functions per port)
 
-*   Using Intel®  DPDK PMD PF igb driver:
+*   Using DPDK PMD PF igb driver:
 
     Kernel Params: iommu=pt, intel_iommu=on modprobe uio
 
     .. code-block:: console
 
         insmod igb_uio
-        ./dpdk_nic_bind.py -b igb_uio bb:ss.f
+        ./dpdk-devbind.py -b igb_uio bb:ss.f
         echo 2 > /sys/bus/pci/devices/0000\:bb\:ss.f/max_vfs (To enable two VFs on a specific pci device)
 
     Launch DPDK testpmd/example or your own host daemon application using the DPDK PMD library.
@@ -406,7 +406,7 @@ The setup procedure is as follows:
 
         modprobe uio
         insmod igb_uio
-        ./dpdk_nic_bind.py -b igb_uio 02:00.0 02:00.1 0e:00.0 0e:00.1
+        ./dpdk-devbind.py -b igb_uio 02:00.0 02:00.1 0e:00.0 0e:00.1
         echo 2 > /sys/bus/pci/devices/0000\:02\:00.0/max_vfs
         echo 2 > /sys/bus/pci/devices/0000\:02\:00.1/max_vfs
         echo 2 > /sys/bus/pci/devices/0000\:0e\:00.0/max_vfs

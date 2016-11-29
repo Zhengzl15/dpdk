@@ -176,7 +176,7 @@ static struct rte_hash_parameters ut_params = {
 	.socket_id = 0,
 };
 
-#define CRC32_ITERATIONS (1U << 20)
+#define CRC32_ITERATIONS (1U << 10)
 #define CRC32_DWORDS (1U << 6)
 /*
  * Test if all CRC32 implementations yield the same hash value
@@ -421,6 +421,46 @@ static int test_add_update_delete(void)
 }
 
 /*
+ * Sequence of operations for retrieving a key with its position
+ *
+ *  - create table
+ *  - add key
+ *  - get the key with its position: hit
+ *  - delete key
+ *  - try to get the deleted key: miss
+ *
+ */
+static int test_hash_get_key_with_position(void)
+{
+	struct rte_hash *handle = NULL;
+	int pos, expectedPos, result;
+	void *key;
+
+	ut_params.name = "hash_get_key_w_pos";
+	handle = rte_hash_create(&ut_params);
+	RETURN_IF_ERROR(handle == NULL, "hash creation failed");
+
+	pos = rte_hash_add_key(handle, &keys[0]);
+	print_key_info("Add", &keys[0], pos);
+	RETURN_IF_ERROR(pos < 0, "failed to add key (pos0=%d)", pos);
+	expectedPos = pos;
+
+	result = rte_hash_get_key_with_position(handle, pos, &key);
+	RETURN_IF_ERROR(result != 0, "error retrieving a key");
+
+	pos = rte_hash_del_key(handle, &keys[0]);
+	print_key_info("Del", &keys[0], pos);
+	RETURN_IF_ERROR(pos != expectedPos,
+			"failed to delete key (pos0=%d)", pos);
+
+	result = rte_hash_get_key_with_position(handle, pos, &key);
+	RETURN_IF_ERROR(result != -ENOENT, "non valid key retrieved");
+
+	rte_hash_free(handle);
+	return 0;
+}
+
+/*
  * Sequence of operations for find existing hash table
  *
  *  - create table
@@ -486,7 +526,7 @@ static int test_five_keys(void)
 	for(i = 0; i < 5; i++)
 		key_array[i] = &keys[i];
 
-	ret = rte_hash_lookup_multi(handle, &key_array[0], 5, (int32_t *)pos);
+	ret = rte_hash_lookup_bulk(handle, &key_array[0], 5, (int32_t *)pos);
 	if(ret == 0)
 		for(i = 0; i < 5; i++) {
 			print_key_info("Lkp", key_array[i], pos[i]);
@@ -527,7 +567,7 @@ static int test_five_keys(void)
 	}
 
 	/* Lookup multi */
-	ret = rte_hash_lookup_multi(handle, &key_array[0], 5, (int32_t *)pos);
+	ret = rte_hash_lookup_bulk(handle, &key_array[0], 5, (int32_t *)pos);
 	if (ret == 0)
 		for (i = 0; i < 5; i++) {
 			print_key_info("Lkp", key_array[i], pos[i]);
@@ -805,15 +845,11 @@ fbk_hash_unit_test(void)
 	RETURN_IF_ERROR_FBK(handle == NULL, "fbk hash creation should have succeeded");
 
 	tmp = rte_fbk_hash_create(&invalid_params_same_name_2);
-	RETURN_IF_ERROR_FBK(tmp == NULL, "fbk hash creation should have succeeded");
-	if (tmp != handle) {
-			printf("ERROR line %d: hashes should have been the same\n", __LINE__);
-			rte_fbk_hash_free(handle);
-			rte_fbk_hash_free(tmp);
-			return -1;
-	}
+	if (tmp != NULL)
+		rte_fbk_hash_free(tmp);
+	RETURN_IF_ERROR_FBK(tmp != NULL, "fbk hash creation should have failed");
 
-	/* we are not freeing tmp or handle here because we need a hash list
+	/* we are not freeing  handle here because we need a hash list
 	 * to be not empty for the next test */
 
 	/* create a hash in non-empty list - good for coverage */
@@ -988,7 +1024,7 @@ static int test_fbk_hash_find_existing(void)
  */
 static int test_hash_creation_with_bad_parameters(void)
 {
-	struct rte_hash *handle;
+	struct rte_hash *handle, *tmp;
 	struct rte_hash_parameters params;
 
 	handle = rte_hash_create(NULL);
@@ -1038,7 +1074,23 @@ static int test_hash_creation_with_bad_parameters(void)
 		return -1;
 	}
 
+	/* test with same name should fail */
+	memcpy(&params, &ut_params, sizeof(params));
+	params.name = "same_name";
+	handle = rte_hash_create(&params);
+	if (handle == NULL) {
+		printf("Cannot create first hash table with 'same_name'\n");
+		return -1;
+	}
+	tmp = rte_hash_create(&params);
+	if (tmp != NULL) {
+		printf("Creation of hash table with same name should fail\n");
+		rte_hash_free(handle);
+		rte_hash_free(tmp);
+		return -1;
+	}
 	rte_hash_free(handle);
+
 	printf("# Test successful. No more errors expected\n");
 
 	return 0;
@@ -1051,12 +1103,12 @@ static int test_hash_creation_with_bad_parameters(void)
 static int
 test_hash_creation_with_good_parameters(void)
 {
-	struct rte_hash *handle, *tmp;
+	struct rte_hash *handle;
 	struct rte_hash_parameters params;
 
 	/* create with null hash function - should choose DEFAULT_HASH_FUNC */
 	memcpy(&params, &ut_params, sizeof(params));
-	params.name = "same_name";
+	params.name = "name";
 	params.hash_func = NULL;
 	handle = rte_hash_create(&params);
 	if (handle == NULL) {
@@ -1064,43 +1116,12 @@ test_hash_creation_with_good_parameters(void)
 		return -1;
 	}
 
-	/* this test is trying to create a hash with the same name as previous one.
-	 * this should return a pointer to the hash we previously created.
-	 * the previous hash isn't freed exactly for the purpose of it being in
-	 * the hash list.
-	 */
-	memcpy(&params, &ut_params, sizeof(params));
-	params.name = "same_name";
-	tmp = rte_hash_create(&params);
-
-	/* check if the returned handle is actually equal to the previous hash */
-	if (handle != tmp) {
-		rte_hash_free(handle);
-		rte_hash_free(tmp);
-		printf("Creating hash with existing name was successful\n");
-		return -1;
-	}
-
-	/* try creating hash when there already are hashes in the list.
-	 * the previous hash is not freed to have a non-empty hash list.
-	 * the other hash that's in the list is still pointed to by "handle" var.
-	 */
-	memcpy(&params, &ut_params, sizeof(params));
-	params.name = "different_name";
-	tmp = rte_hash_create(&params);
-	if (tmp == NULL) {
-		rte_hash_free(handle);
-		printf("Creating hash with valid parameters failed\n");
-		return -1;
-	}
-
-	rte_hash_free(tmp);
 	rte_hash_free(handle);
 
 	return 0;
 }
 
-#define ITERATIONS 50
+#define ITERATIONS 3
 /*
  * Test to see the average table utilization (entries added/max entries)
  * before hitting a random entry that cannot be added
@@ -1117,7 +1138,7 @@ static int test_average_table_utilization(void)
 	       "\n  before adding elements begins to fail\n");
 	printf("Measuring performance, please wait");
 	fflush(stdout);
-	ut_params.entries = 1 << 20;
+	ut_params.entries = 1 << 16;
 	ut_params.name = "test_average_utilization";
 	ut_params.hash_func = rte_jhash;
 	handle = rte_hash_create(&ut_params);
@@ -1157,7 +1178,7 @@ static int test_average_table_utilization(void)
 	return 0;
 }
 
-#define NUM_ENTRIES 1024
+#define NUM_ENTRIES 256
 static int test_hash_iteration(void)
 {
 	struct rte_hash *handle;
@@ -1461,6 +1482,8 @@ test_hash(void)
 		return -1;
 	if (test_hash_add_delete_jhash_3word() < 0)
 		return -1;
+	if (test_hash_get_key_with_position() < 0)
+		return -1;
 	if (test_hash_find_existing() < 0)
 		return -1;
 	if (test_add_update_delete() < 0)
@@ -1491,8 +1514,4 @@ test_hash(void)
 	return 0;
 }
 
-static struct test_command hash_cmd = {
-	.command = "hash_autotest",
-	.callback = test_hash,
-};
-REGISTER_TEST_COMMAND(hash_cmd);
+REGISTER_TEST_COMMAND(hash_autotest, test_hash);

@@ -45,10 +45,7 @@ else
 EXECENV_CFLAGS  = -pthread
 endif
 
-# Workaround lack of DT_NEEDED entry
-EXECENV_LDFLAGS = --no-as-needed
-
-EXECENV_LDLIBS  = -lrt -lm
+EXECENV_LDLIBS  =
 EXECENV_ASFLAGS =
 
 ifeq ($(CONFIG_RTE_BUILD_SHARED_LIB),y)

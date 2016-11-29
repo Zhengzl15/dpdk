@@ -54,7 +54,6 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <linux/if.h>
 #include <linux/ethtool.h>
 #include <linux/sockios.h>
 #include <fcntl.h>
@@ -73,7 +72,6 @@
 #ifdef PEDANTIC
 #pragma GCC diagnostic ignored "-pedantic"
 #endif
-#include <rte_config.h>
 #include <rte_ether.h>
 #include <rte_ethdev.h>
 #include <rte_dev.h>
@@ -87,6 +85,7 @@
 #include <rte_version.h>
 #include <rte_log.h>
 #include <rte_alarm.h>
+#include <rte_memory.h>
 #ifdef PEDANTIC
 #pragma GCC diagnostic error "-pedantic"
 #endif
@@ -131,15 +130,6 @@ typedef union {
 } wr_id_t;
 
 #define WR_ID(o) (((wr_id_t *)&(o))->data)
-
-/* Compile-time check. */
-static inline void wr_id_t_check(void)
-{
-	wr_id_t check[1 + (2 * -!(sizeof(wr_id_t) == sizeof(uint64_t)))];
-
-	(void)check;
-	(void)wr_id_t_check;
-}
 
 /* Transpose flags. Useful to convert IBV to DPDK flags. */
 #define TRANSPOSE(val, from, to) \
@@ -206,7 +196,6 @@ struct rxq {
 	unsigned int sp:1; /* Use scattered RX elements. */
 	unsigned int csum:1; /* Enable checksum offloading. */
 	unsigned int csum_l2tun:1; /* Same for L2 tunnels. */
-	uint32_t mb_len; /* Length of a mp-issued mbuf. */
 	struct mlx4_rxq_stats stats; /* RX queue counters. */
 	unsigned int socket; /* CPU socket ID for allocations. */
 	struct ibv_exp_res_domain *rd; /* Resource Domain. */
@@ -668,7 +657,15 @@ priv_get_mtu(struct priv *priv, uint16_t *mtu)
 static int
 priv_set_mtu(struct priv *priv, uint16_t mtu)
 {
-	return priv_set_sysfs_ulong(priv, "mtu", mtu);
+	uint16_t new_mtu;
+
+	if (priv_set_sysfs_ulong(priv, "mtu", mtu) ||
+	    priv_get_mtu(priv, &new_mtu))
+		return -1;
+	if (new_mtu == mtu)
+		return 0;
+	errno = EINVAL;
+	return -1;
 }
 
 /**
@@ -692,7 +689,7 @@ priv_set_flags(struct priv *priv, unsigned int keep, unsigned int flags)
 	if (priv_get_sysfs_ulong(priv, "flags", &tmp) == -1)
 		return -1;
 	tmp &= keep;
-	tmp |= flags;
+	tmp |= (flags & (~keep));
 	return priv_set_sysfs_ulong(priv, "flags", tmp);
 }
 
@@ -707,7 +704,7 @@ txq_cleanup(struct txq *txq);
 
 static int
 rxq_setup(struct rte_eth_dev *dev, struct rxq *rxq, uint16_t desc,
-	  unsigned int socket, const struct rte_eth_rxconf *conf,
+	  unsigned int socket, int inactive, const struct rte_eth_rxconf *conf,
 	  struct rte_mempool *mp);
 
 static void
@@ -743,6 +740,15 @@ dev_configure(struct rte_eth_dev *dev)
 	}
 	if (rxqs_n == priv->rxqs_n)
 		return 0;
+	if (!rte_is_power_of_2(rxqs_n)) {
+		unsigned n_active;
+
+		n_active = rte_align32pow2(rxqs_n + 1) >> 1;
+		WARN("%p: number of RX queues must be a power"
+			" of 2: %u queues among %u will be active",
+			(void *)dev, n_active, rxqs_n);
+	}
+
 	INFO("%p: RX queues number update: %u -> %u",
 	     (void *)dev, priv->rxqs_n, rxqs_n);
 	/* If RSS is enabled, disable it first. */
@@ -778,7 +784,7 @@ dev_configure(struct rte_eth_dev *dev)
 	priv->rss = 1;
 	tmp = priv->rxqs_n;
 	priv->rxqs_n = rxqs_n;
-	ret = rxq_setup(dev, &priv->rxq_parent, 0, 0, NULL, NULL);
+	ret = rxq_setup(dev, &priv->rxq_parent, 0, 0, 0, NULL, NULL);
 	if (!ret)
 		return 0;
 	/* Failure, rollback. */
@@ -998,7 +1004,7 @@ txq_alloc_elts(struct txq *txq, unsigned int elts_n)
 	}
 	mr_linear =
 		ibv_reg_mr(txq->priv->pd, elts_linear, sizeof(*elts_linear),
-			   (IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE));
+			   IBV_ACCESS_LOCAL_WRITE);
 	if (mr_linear == NULL) {
 		ERROR("%p: unable to configure MR, ibv_reg_mr() failed",
 		      (void *)txq);
@@ -1047,14 +1053,20 @@ error:
 static void
 txq_free_elts(struct txq *txq)
 {
-	unsigned int i;
 	unsigned int elts_n = txq->elts_n;
+	unsigned int elts_head = txq->elts_head;
+	unsigned int elts_tail = txq->elts_tail;
 	struct txq_elt (*elts)[elts_n] = txq->elts;
 	linear_t (*elts_linear)[elts_n] = txq->elts_linear;
 	struct ibv_mr *mr_linear = txq->mr_linear;
 
 	DEBUG("%p: freeing WRs", (void *)txq);
 	txq->elts_n = 0;
+	txq->elts_head = 0;
+	txq->elts_tail = 0;
+	txq->elts_comp = 0;
+	txq->elts_comp_cd = 0;
+	txq->elts_comp_cd_init = 0;
 	txq->elts = NULL;
 	txq->elts_linear = NULL;
 	txq->mr_linear = NULL;
@@ -1064,12 +1076,17 @@ txq_free_elts(struct txq *txq)
 	rte_free(elts_linear);
 	if (elts == NULL)
 		return;
-	for (i = 0; (i != elemof(*elts)); ++i) {
-		struct txq_elt *elt = &(*elts)[i];
+	while (elts_tail != elts_head) {
+		struct txq_elt *elt = &(*elts)[elts_tail];
 
-		if (elt->buf == NULL)
-			continue;
+		assert(elt->buf != NULL);
 		rte_pktmbuf_free(elt->buf);
+#ifndef NDEBUG
+		/* Poisoning. */
+		memset(elt, 0x77, sizeof(*elt));
+#endif
+		if (++elts_tail == elts_n)
+			elts_tail = 0;
 	}
 	rte_free(elts);
 }
@@ -1187,6 +1204,121 @@ txq_complete(struct txq *txq)
 	return 0;
 }
 
+struct mlx4_check_mempool_data {
+	int ret;
+	char *start;
+	char *end;
+};
+
+/* Called by mlx4_check_mempool() when iterating the memory chunks. */
+static void mlx4_check_mempool_cb(struct rte_mempool *mp,
+	void *opaque, struct rte_mempool_memhdr *memhdr,
+	unsigned mem_idx)
+{
+	struct mlx4_check_mempool_data *data = opaque;
+
+	(void)mp;
+	(void)mem_idx;
+
+	/* It already failed, skip the next chunks. */
+	if (data->ret != 0)
+		return;
+	/* It is the first chunk. */
+	if (data->start == NULL && data->end == NULL) {
+		data->start = memhdr->addr;
+		data->end = data->start + memhdr->len;
+		return;
+	}
+	if (data->end == memhdr->addr) {
+		data->end += memhdr->len;
+		return;
+	}
+	if (data->start == (char *)memhdr->addr + memhdr->len) {
+		data->start -= memhdr->len;
+		return;
+	}
+	/* Error, mempool is not virtually contigous. */
+	data->ret = -1;
+}
+
+/**
+ * Check if a mempool can be used: it must be virtually contiguous.
+ *
+ * @param[in] mp
+ *   Pointer to memory pool.
+ * @param[out] start
+ *   Pointer to the start address of the mempool virtual memory area
+ * @param[out] end
+ *   Pointer to the end address of the mempool virtual memory area
+ *
+ * @return
+ *   0 on success (mempool is virtually contiguous), -1 on error.
+ */
+static int mlx4_check_mempool(struct rte_mempool *mp, uintptr_t *start,
+	uintptr_t *end)
+{
+	struct mlx4_check_mempool_data data;
+
+	memset(&data, 0, sizeof(data));
+	rte_mempool_mem_iter(mp, mlx4_check_mempool_cb, &data);
+	*start = (uintptr_t)data.start;
+	*end = (uintptr_t)data.end;
+
+	return data.ret;
+}
+
+/* For best performance, this function should not be inlined. */
+static struct ibv_mr *mlx4_mp2mr(struct ibv_pd *, struct rte_mempool *)
+	__attribute__((noinline));
+
+/**
+ * Register mempool as a memory region.
+ *
+ * @param pd
+ *   Pointer to protection domain.
+ * @param mp
+ *   Pointer to memory pool.
+ *
+ * @return
+ *   Memory region pointer, NULL in case of error.
+ */
+static struct ibv_mr *
+mlx4_mp2mr(struct ibv_pd *pd, struct rte_mempool *mp)
+{
+	const struct rte_memseg *ms = rte_eal_get_physmem_layout();
+	uintptr_t start;
+	uintptr_t end;
+	unsigned int i;
+
+	if (mlx4_check_mempool(mp, &start, &end) != 0) {
+		ERROR("mempool %p: not virtually contiguous",
+			(void *)mp);
+		return NULL;
+	}
+
+	DEBUG("mempool %p area start=%p end=%p size=%zu",
+	      (void *)mp, (void *)start, (void *)end,
+	      (size_t)(end - start));
+	/* Round start and end to page boundary if found in memory segments. */
+	for (i = 0; (i < RTE_MAX_MEMSEG) && (ms[i].addr != NULL); ++i) {
+		uintptr_t addr = (uintptr_t)ms[i].addr;
+		size_t len = ms[i].len;
+		unsigned int align = ms[i].hugepage_sz;
+
+		if ((start > addr) && (start < addr + len))
+			start = RTE_ALIGN_FLOOR(start, align);
+		if ((end > addr) && (end < addr + len))
+			end = RTE_ALIGN_CEIL(end, align);
+	}
+	DEBUG("mempool %p using start=%p end=%p size=%zu for MR",
+	      (void *)mp, (void *)start, (void *)end,
+	      (size_t)(end - start));
+	return ibv_reg_mr(pd,
+			  (void *)start,
+			  end - start,
+			  IBV_ACCESS_LOCAL_WRITE);
+}
+
 /**
  * Get Memory Pool (MP) from mbuf. If mbuf is indirect, the pool from which
  * the cloned mbuf is allocated is returned instead.
@@ -1219,7 +1351,7 @@ txq_mb2mp(struct rte_mbuf *buf)
  *   mr->lkey on success, (uint32_t)-1 on failure.
  */
 static uint32_t
-txq_mp2mr(struct txq *txq, const struct rte_mempool *mp)
+txq_mp2mr(struct txq *txq, struct rte_mempool *mp)
 {
 	unsigned int i;
 	struct ibv_mr *mr;
@@ -1237,11 +1369,8 @@ txq_mp2mr(struct txq *txq, const struct rte_mempool *mp)
 	}
 	/* Add a new entry, register MR first. */
 	DEBUG("%p: discovered new memory pool \"%s\" (%p)",
-	      (void *)txq, mp->name, (const void *)mp);
-	mr = ibv_reg_mr(txq->priv->pd,
-			(void *)mp->elt_va_start,
-			(mp->elt_va_end - mp->elt_va_start),
-			(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE));
+	      (void *)txq, mp->name, (void *)mp);
+	mr = mlx4_mp2mr(txq->priv->pd, mp);
 	if (unlikely(mr == NULL)) {
 		DEBUG("%p: unable to configure MR, ibv_reg_mr() failed.",
 		      (void *)txq);
@@ -1261,12 +1390,11 @@ txq_mp2mr(struct txq *txq, const struct rte_mempool *mp)
 	txq->mp2mr[i].mr = mr;
 	txq->mp2mr[i].lkey = mr->lkey;
 	DEBUG("%p: new MR lkey for MP \"%s\" (%p): 0x%08" PRIu32,
-	      (void *)txq, mp->name, (const void *)mp, txq->mp2mr[i].lkey);
+	      (void *)txq, mp->name, (void *)mp, txq->mp2mr[i].lkey);
 	return txq->mp2mr[i].lkey;
 }
 
 struct txq_mp2mr_mbuf_check_data {
-	const struct rte_mempool *mp;
 	int ret;
 };
 
@@ -1274,34 +1402,26 @@ struct txq_mp2mr_mbuf_check_data {
  * Callback function for rte_mempool_obj_iter() to check whether a given
  * mempool object looks like a mbuf.
  *
- * @param[in, out] arg
- *   Context data (struct txq_mp2mr_mbuf_check_data). Contains mempool pointer
- *   and return value.
- * @param[in] start
- *   Object start address.
- * @param[in] end
- *   Object end address.
+ * @param[in] mp
+ *   The mempool pointer
+ * @param[in] arg
+ *   Context data (struct txq_mp2mr_mbuf_check_data). Contains the
+ *   return value.
+ * @param[in] obj
+ *   Object address.
  * @param index
- *   Unused.
- *
- * @return
- *   Nonzero value when object is not a mbuf.
+ *   Object index, unused.
  */
 static void
-txq_mp2mr_mbuf_check(void *arg, void *start, void *end,
-		     uint32_t index __rte_unused)
+txq_mp2mr_mbuf_check(struct rte_mempool *mp, void *arg, void *obj,
+	uint32_t index __rte_unused)
 {
 	struct txq_mp2mr_mbuf_check_data *data = arg;
-	struct rte_mbuf *buf =
-		(void *)((uintptr_t)start + data->mp->header_size);
+	struct rte_mbuf *buf = obj;
 
-	(void)index;
 	/* Check whether mbuf structure fits element size and whether mempool
 	 * pointer is valid. */
-	if (((uintptr_t)end >= (uintptr_t)(buf + 1)) &&
-	    (buf->pool == data->mp))
-		data->ret = 0;
-	else
+	if (sizeof(*buf) > mp->elt_size || buf->pool != mp)
 		data->ret = -1;
 }
 
@@ -1315,28 +1435,16 @@ txq_mp2mr_mbuf_check(void *arg, void *start, void *end,
  *   Pointer to TX queue structure.
  */
 static void
-txq_mp2mr_iter(const struct rte_mempool *mp, void *arg)
+txq_mp2mr_iter(struct rte_mempool *mp, void *arg)
 {
 	struct txq *txq = arg;
 	struct txq_mp2mr_mbuf_check_data data = {
-		.mp = mp,
-		.ret = -1,
+		.ret = 0,
 	};
 
-	/* Discard empty mempools. */
-	if (mp->size == 0)
-		return;
 	/* Register mempool only if the first element looks like a mbuf. */
-	rte_mempool_obj_iter((void *)mp->elt_va_start,
-			     1,
-			     mp->header_size + mp->elt_size + mp->trailer_size,
-			     1,
-			     mp->elt_pa,
-			     mp->pg_num,
-			     mp->pg_shift,
-			     txq_mp2mr_mbuf_check,
-			     &data);
-	if (data.ret)
+	if (rte_mempool_obj_iter(mp, txq_mp2mr_mbuf_check, &data) == 0 ||
+			data.ret == -1)
 		return;
 	txq_mp2mr(txq, mp);
 }
@@ -1545,6 +1653,10 @@ mlx4_tx_burst(void *dpdk_txq, struct rte_mbuf **pkts, uint16_t pkts_n)
 		if (likely(elt->buf != NULL)) {
 			struct rte_mbuf *tmp = elt->buf;
 
+#ifndef NDEBUG
+			/* Poisoning. */
+			memset(elt, 0x66, sizeof(*elt));
+#endif
 			/* Faster than rte_pktmbuf_free(). */
 			do {
 				struct rte_mbuf *next = NEXT(tmp);
@@ -2836,6 +2948,8 @@ rxq_cleanup(struct rxq *rxq)
  * @param flags
  *   RX completion flags returned by poll_length_flags().
  *
+ * @note: fix mlx4_dev_supported_ptypes_get() if any change here.
+ *
  * @return
  *   Packet type for struct rte_mbuf.
  */
@@ -3015,7 +3129,7 @@ mlx4_rx_burst_sp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 			 * cacheline while allocating rep.
 			 */
 			rte_prefetch0(seg);
-			rep = __rte_mbuf_raw_alloc(rxq->mp);
+			rep = rte_mbuf_raw_alloc(rxq->mp);
 			if (unlikely(rep == NULL)) {
 				/*
 				 * Unable to allocate a replacement mbuf,
@@ -3044,7 +3158,6 @@ mlx4_rx_burst_sp(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 			rep->ol_flags = -1;
 #endif
 			assert(rep->buf_len == seg->buf_len);
-			assert(rep->buf_len == rxq->mb_len);
 			/* Reconfigure sge to use rep instead of seg. */
 			assert(sge->lkey == rxq->mr->lkey);
 			sge->addr = ((uintptr_t)rep->buf_addr + seg_headroom);
@@ -3175,8 +3288,8 @@ mlx4_rx_burst(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 		 * Fetch initial bytes of packet descriptor into a
 		 * cacheline while allocating rep.
 		 */
-		rte_prefetch0(seg);
-		rte_prefetch0(&seg->cacheline1);
+		rte_mbuf_prefetch_part1(seg);
+		rte_mbuf_prefetch_part2(seg);
 		ret = rxq->if_cq->poll_length_flags(rxq->cq, NULL, NULL,
 						    &flags);
 		if (unlikely(ret < 0)) {
@@ -3214,7 +3327,7 @@ mlx4_rx_burst(void *dpdk_rxq, struct rte_mbuf **pkts, uint16_t pkts_n)
 		if (ret == 0)
 			break;
 		len = ret;
-		rep = __rte_mbuf_raw_alloc(rxq->mp);
+		rep = rte_mbuf_raw_alloc(rxq->mp);
 		if (unlikely(rep == NULL)) {
 			/*
 			 * Unable to allocate a replacement mbuf,
@@ -3426,7 +3539,8 @@ rxq_setup_qp_rss(struct priv *priv, struct ibv_cq *cq, uint16_t desc,
 		attr.qpg.qpg_type = IBV_EXP_QPG_PARENT;
 		/* TSS isn't necessary. */
 		attr.qpg.parent_attrib.tss_child_count = 0;
-		attr.qpg.parent_attrib.rss_child_count = priv->rxqs_n;
+		attr.qpg.parent_attrib.rss_child_count =
+			rte_align32pow2(priv->rxqs_n + 1) >> 1;
 		DEBUG("initializing parent RSS queue");
 	} else {
 		attr.qpg.qpg_type = IBV_EXP_QPG_CHILD_RX;
@@ -3464,6 +3578,7 @@ rxq_rehash(struct rte_eth_dev *dev, struct rxq *rxq)
 	unsigned int i, k;
 	struct ibv_exp_qp_attr mod;
 	struct ibv_recv_wr *bad_wr;
+	unsigned int mb_len;
 	int err;
 	int parent = (rxq == &priv->rxq_parent);
 
@@ -3472,6 +3587,7 @@ rxq_rehash(struct rte_eth_dev *dev, struct rxq *rxq)
 		      (void *)dev, (void *)rxq);
 		return EINVAL;
 	}
+	mb_len = rte_pktmbuf_data_room_size(rxq->mp);
 	DEBUG("%p: rehashing queue %p", (void *)dev, (void *)rxq);
 	/* Number of descriptors and mbufs currently allocated. */
 	desc_n = (tmpl.elts_n * (tmpl.sp ? MLX4_PMD_SGE_WR_N : 1));
@@ -3486,9 +3602,10 @@ rxq_rehash(struct rte_eth_dev *dev, struct rxq *rxq)
 		rxq->csum_l2tun = tmpl.csum_l2tun;
 	}
 	/* Enable scattered packets support for this queue if necessary. */
+	assert(mb_len >= RTE_PKTMBUF_HEADROOM);
 	if ((dev->data->dev_conf.rxmode.jumbo_frame) &&
 	    (dev->data->dev_conf.rxmode.max_rx_pkt_len >
-	     (tmpl.mb_len - RTE_PKTMBUF_HEADROOM))) {
+	     (mb_len - RTE_PKTMBUF_HEADROOM))) {
 		tmpl.sp = 1;
 		desc_n /= MLX4_PMD_SGE_WR_N;
 	} else
@@ -3649,6 +3766,9 @@ skip_rtr:
  *   Number of descriptors to configure in queue.
  * @param socket
  *   NUMA socket on which memory must be allocated.
+ * @param inactive
+ *   If true, the queue is disabled because its index is higher or
+ *   equal to the real number of queues, which must be a power of 2.
  * @param[in] conf
  *   Thresholds parameters.
  * @param mp
@@ -3659,7 +3779,7 @@ skip_rtr:
  */
 static int
 rxq_setup(struct rte_eth_dev *dev, struct rxq *rxq, uint16_t desc,
-	  unsigned int socket, const struct rte_eth_rxconf *conf,
+	  unsigned int socket, int inactive, const struct rte_eth_rxconf *conf,
 	  struct rte_mempool *mp)
 {
 	struct priv *priv = dev->data->dev_private;
@@ -3676,7 +3796,7 @@ rxq_setup(struct rte_eth_dev *dev, struct rxq *rxq, uint16_t desc,
 	} attr;
 	enum ibv_exp_query_intf_status status;
 	struct ibv_recv_wr *bad_wr;
-	struct rte_mbuf *buf;
+	unsigned int mb_len;
 	int ret = 0;
 	int parent = (rxq == &priv->rxq_parent);
 
@@ -3692,42 +3812,29 @@ rxq_setup(struct rte_eth_dev *dev, struct rxq *rxq, uint16_t desc,
 		desc = 1;
 		goto skip_mr;
 	}
+	mb_len = rte_pktmbuf_data_room_size(mp);
 	if ((desc == 0) || (desc % MLX4_PMD_SGE_WR_N)) {
 		ERROR("%p: invalid number of RX descriptors (must be a"
 		      " multiple of %d)", (void *)dev, MLX4_PMD_SGE_WR_N);
 		return EINVAL;
 	}
-	/* Get mbuf length. */
-	buf = rte_pktmbuf_alloc(mp);
-	if (buf == NULL) {
-		ERROR("%p: unable to allocate mbuf", (void *)dev);
-		return ENOMEM;
-	}
-	tmpl.mb_len = buf->buf_len;
-	assert((rte_pktmbuf_headroom(buf) +
-		rte_pktmbuf_tailroom(buf)) == tmpl.mb_len);
-	assert(rte_pktmbuf_headroom(buf) == RTE_PKTMBUF_HEADROOM);
-	rte_pktmbuf_free(buf);
 	/* Toggle RX checksum offload if hardware supports it. */
 	if (priv->hw_csum)
 		tmpl.csum = !!dev->data->dev_conf.rxmode.hw_ip_checksum;
 	if (priv->hw_csum_l2tun)
 		tmpl.csum_l2tun = !!dev->data->dev_conf.rxmode.hw_ip_checksum;
 	/* Enable scattered packets support for this queue if necessary. */
+	assert(mb_len >= RTE_PKTMBUF_HEADROOM);
 	if ((dev->data->dev_conf.rxmode.jumbo_frame) &&
 	    (dev->data->dev_conf.rxmode.max_rx_pkt_len >
-	     (tmpl.mb_len - RTE_PKTMBUF_HEADROOM))) {
+	     (mb_len - RTE_PKTMBUF_HEADROOM))) {
 		tmpl.sp = 1;
 		desc /= MLX4_PMD_SGE_WR_N;
 	}
 	DEBUG("%p: %s scattered packets support (%u WRs)",
 	      (void *)dev, (tmpl.sp ? "enabling" : "disabling"), desc);
 	/* Use the entire RX mempool as the memory region. */
-	tmpl.mr = ibv_reg_mr(priv->pd,
-			     (void *)mp->elt_va_start,
-			     (mp->elt_va_end - mp->elt_va_start),
-			     (IBV_ACCESS_LOCAL_WRITE |
-			      IBV_ACCESS_REMOTE_WRITE));
+	tmpl.mr = mlx4_mp2mr(priv->pd, mp);
 	if (tmpl.mr == NULL) {
 		ret = EINVAL;
 		ERROR("%p: MR creation failure: %s",
@@ -3764,7 +3871,7 @@ skip_mr:
 	DEBUG("priv->device_attr.max_sge is %d",
 	      priv->device_attr.max_sge);
 #ifdef RSS_SUPPORT
-	if (priv->rss)
+	if (priv->rss && !inactive)
 		tmpl.qp = rxq_setup_qp_rss(priv, tmpl.cq, desc, parent,
 					   tmpl.rd);
 	else
@@ -3900,6 +4007,7 @@ mlx4_rx_queue_setup(struct rte_eth_dev *dev, uint16_t idx, uint16_t desc,
 {
 	struct priv *priv = dev->data->dev_private;
 	struct rxq *rxq = (*priv->rxqs)[idx];
+	int inactive = 0;
 	int ret;
 
 	if (mlx4_is_secondary())
@@ -3931,7 +4039,9 @@ mlx4_rx_queue_setup(struct rte_eth_dev *dev, uint16_t idx, uint16_t desc,
 			return -ENOMEM;
 		}
 	}
-	ret = rxq_setup(dev, rxq, desc, socket, conf, mp);
+	if (idx >= rte_align32pow2(priv->rxqs_n + 1) >> 1)
+		inactive = 1;
+	ret = rxq_setup(dev, rxq, desc, socket, inactive, conf, mp);
 	if (ret)
 		rte_free(rxq);
 	else {
@@ -4218,6 +4328,90 @@ mlx4_dev_close(struct rte_eth_dev *dev)
 }
 
 /**
+ * Change the link state (UP / DOWN).
+ *
+ * @param priv
+ *   Pointer to Ethernet device private data.
+ * @param up
+ *   Nonzero for link up, otherwise link down.
+ *
+ * @return
+ *   0 on success, errno value on failure.
+ */
+static int
+priv_set_link(struct priv *priv, int up)
+{
+	struct rte_eth_dev *dev = priv->dev;
+	int err;
+	unsigned int i;
+
+	if (up) {
+		err = priv_set_flags(priv, ~IFF_UP, IFF_UP);
+		if (err)
+			return err;
+		for (i = 0; i < priv->rxqs_n; i++)
+			if ((*priv->rxqs)[i]->sp)
+				break;
+		/* Check if an sp queue exists.
+		 * Note: Some old frames might be received.
+		 */
+		if (i == priv->rxqs_n)
+			dev->rx_pkt_burst = mlx4_rx_burst;
+		else
+			dev->rx_pkt_burst = mlx4_rx_burst_sp;
+		dev->tx_pkt_burst = mlx4_tx_burst;
+	} else {
+		err = priv_set_flags(priv, ~IFF_UP, ~IFF_UP);
+		if (err)
+			return err;
+		dev->rx_pkt_burst = removed_rx_burst;
+		dev->tx_pkt_burst = removed_tx_burst;
+	}
+	return 0;
+}
+
+/**
+ * DPDK callback to bring the link DOWN.
+ *
+ * @param dev
+ *   Pointer to Ethernet device structure.
+ *
+ * @return
+ *   0 on success, errno value on failure.
+ */
+static int
+mlx4_set_link_down(struct rte_eth_dev *dev)
+{
+	struct priv *priv = dev->data->dev_private;
+	int err;
+
+	priv_lock(priv);
+	err = priv_set_link(priv, 0);
+	priv_unlock(priv);
+	return err;
+}
+
+/**
+ * DPDK callback to bring the link UP.
+ *
+ * @param dev
+ *   Pointer to Ethernet device structure.
+ *
+ * @return
+ *   0 on success, errno value on failure.
+ */
+static int
+mlx4_set_link_up(struct rte_eth_dev *dev)
+{
+	struct priv *priv = dev->data->dev_private;
+	int err;
+
+	priv_lock(priv);
+	err = priv_set_link(priv, 1);
+	priv_unlock(priv);
+	return err;
+}
+/**
  * DPDK callback to get information about the device.
  *
  * @param dev
@@ -4265,7 +4459,31 @@ mlx4_dev_infos_get(struct rte_eth_dev *dev, struct rte_eth_dev_info *info)
 		 0);
 	if (priv_get_ifname(priv, &ifname) == 0)
 		info->if_index = if_nametoindex(ifname);
+	info->speed_capa =
+			ETH_LINK_SPEED_1G |
+			ETH_LINK_SPEED_10G |
+			ETH_LINK_SPEED_20G |
+			ETH_LINK_SPEED_40G |
+			ETH_LINK_SPEED_56G;
 	priv_unlock(priv);
+}
+
+static const uint32_t *
+mlx4_dev_supported_ptypes_get(struct rte_eth_dev *dev)
+{
+	static const uint32_t ptypes[] = {
+		/* refers to rxq_cq_to_pkt_type() */
+		RTE_PTYPE_L3_IPV4,
+		RTE_PTYPE_L3_IPV6,
+		RTE_PTYPE_INNER_L3_IPV4,
+		RTE_PTYPE_INNER_L3_IPV6,
+		RTE_PTYPE_UNKNOWN
+	};
+
+	if (dev->rx_pkt_burst == mlx4_rx_burst ||
+	    dev->rx_pkt_burst == mlx4_rx_burst_sp)
+		return ptypes;
+	return NULL;
 }
 
 /**
@@ -4429,6 +4647,22 @@ mlx4_mac_addr_add(struct rte_eth_dev *dev, struct ether_addr *mac_addr,
 			  mac_addr->addr_bytes);
 end:
 	priv_unlock(priv);
+}
+
+/**
+ * DPDK callback to set the primary MAC address.
+ *
+ * @param dev
+ *   Pointer to Ethernet device structure.
+ * @param mac_addr
+ *   MAC address to register.
+ */
+static void
+mlx4_mac_addr_set(struct rte_eth_dev *dev, struct ether_addr *mac_addr)
+{
+	DEBUG("%p: setting primary MAC address", (void *)dev);
+	mlx4_mac_addr_remove(dev, 0);
+	mlx4_mac_addr_add(dev, mac_addr, 0, 0);
 }
 
 /**
@@ -4620,7 +4854,7 @@ mlx4_link_update_unlocked(struct rte_eth_dev *dev, int wait_to_complete)
 	memset(&dev_link, 0, sizeof(dev_link));
 	dev_link.link_status = ((ifr.ifr_flags & IFF_UP) &&
 				(ifr.ifr_flags & IFF_RUNNING));
-	ifr.ifr_data = &edata;
+	ifr.ifr_data = (void *)&edata;
 	if (priv_ifreq(priv, SIOCETHTOOL, &ifr)) {
 		WARN("ioctl(SIOCETHTOOL, ETHTOOL_GSET) failed: %s",
 		     strerror(errno));
@@ -4633,6 +4867,8 @@ mlx4_link_update_unlocked(struct rte_eth_dev *dev, int wait_to_complete)
 		dev_link.link_speed = link_speed;
 	dev_link.link_duplex = ((edata.duplex == DUPLEX_HALF) ?
 				ETH_LINK_HALF_DUPLEX : ETH_LINK_FULL_DUPLEX);
+	dev_link.link_autoneg = !(dev->data->dev_conf.link_speeds &
+			ETH_LINK_SPEED_FIXED);
 	if (memcmp(&dev_link, &dev->data->dev_link, sizeof(dev_link))) {
 		/* Link status changed. */
 		dev->data->dev_link = dev_link;
@@ -4712,6 +4948,7 @@ mlx4_dev_set_mtu(struct rte_eth_dev *dev, uint16_t mtu)
 	/* Reconfigure each RX queue. */
 	for (i = 0; (i != priv->rxqs_n); ++i) {
 		struct rxq *rxq = (*priv->rxqs)[i];
+		unsigned int mb_len;
 		unsigned int max_frame_len;
 		int sp;
 
@@ -4721,7 +4958,9 @@ mlx4_dev_set_mtu(struct rte_eth_dev *dev, uint16_t mtu)
 		 * toggle scattered support (sp) if necessary. */
 		max_frame_len = (priv->mtu + ETHER_HDR_LEN +
 				 (ETHER_MAX_VLAN_FRAME_LEN - ETHER_MAX_LEN));
-		sp = (max_frame_len > (rxq->mb_len - RTE_PKTMBUF_HEADROOM));
+		mb_len = rte_pktmbuf_data_room_size(rxq->mp);
+		assert(mb_len >= RTE_PKTMBUF_HEADROOM);
+		sp = (max_frame_len > (mb_len - RTE_PKTMBUF_HEADROOM));
 		/* Provide new values to rxq_setup(). */
 		dev->data->dev_conf.rxmode.jumbo_frame = sp;
 		dev->data->dev_conf.rxmode.max_rx_pkt_len = max_frame_len;
@@ -4777,7 +5016,7 @@ mlx4_dev_get_flow_ctrl(struct rte_eth_dev *dev, struct rte_eth_fc_conf *fc_conf)
 
 	if (mlx4_is_secondary())
 		return -E_RTE_SECONDARY;
-	ifr.ifr_data = &ethpause;
+	ifr.ifr_data = (void *)&ethpause;
 	priv_lock(priv);
 	if (priv_ifreq(priv, SIOCETHTOOL, &ifr)) {
 		ret = errno;
@@ -4827,7 +5066,7 @@ mlx4_dev_set_flow_ctrl(struct rte_eth_dev *dev, struct rte_eth_fc_conf *fc_conf)
 
 	if (mlx4_is_secondary())
 		return -E_RTE_SECONDARY;
-	ifr.ifr_data = &ethpause;
+	ifr.ifr_data = (void *)&ethpause;
 	ethpause.autoneg = fc_conf->autoneg;
 	if (((fc_conf->mode & RTE_FC_FULL) == RTE_FC_FULL) ||
 	    (fc_conf->mode & RTE_FC_RX_PAUSE))
@@ -4979,6 +5218,8 @@ static const struct eth_dev_ops mlx4_dev_ops = {
 	.dev_configure = mlx4_dev_configure,
 	.dev_start = mlx4_dev_start,
 	.dev_stop = mlx4_dev_stop,
+	.dev_set_link_down = mlx4_set_link_down,
+	.dev_set_link_up = mlx4_set_link_up,
 	.dev_close = mlx4_dev_close,
 	.promiscuous_enable = mlx4_promiscuous_enable,
 	.promiscuous_disable = mlx4_promiscuous_disable,
@@ -4989,6 +5230,7 @@ static const struct eth_dev_ops mlx4_dev_ops = {
 	.stats_reset = mlx4_stats_reset,
 	.queue_stats_mapping_set = NULL,
 	.dev_infos_get = mlx4_dev_infos_get,
+	.dev_supported_ptypes_get = mlx4_dev_supported_ptypes_get,
 	.vlan_filter_set = mlx4_vlan_filter_set,
 	.vlan_tpid_set = NULL,
 	.vlan_strip_queue_set = NULL,
@@ -5004,9 +5246,8 @@ static const struct eth_dev_ops mlx4_dev_ops = {
 	.priority_flow_ctrl_set = NULL,
 	.mac_addr_remove = mlx4_mac_addr_remove,
 	.mac_addr_add = mlx4_mac_addr_add,
+	.mac_addr_set = mlx4_mac_addr_set,
 	.mtu_set = mlx4_dev_set_mtu,
-	.udp_tunnel_add = NULL,
-	.udp_tunnel_del = NULL,
 };
 
 /**
@@ -5253,7 +5494,7 @@ priv_dev_interrupt_handler_uninstall(struct priv *priv, struct rte_eth_dev *dev)
 		rte_eal_alarm_cancel(mlx4_dev_link_status_handler, dev);
 	priv->pending_alarm = 0;
 	priv->intr_handle.fd = 0;
-	priv->intr_handle.type = 0;
+	priv->intr_handle.type = RTE_INTR_HANDLE_UNKNOWN;
 }
 
 /**
@@ -5412,6 +5653,13 @@ mlx4_pci_devinit(struct rte_pci_driver *pci_drv, struct rte_pci_device *pci_dev)
 			ERROR("port query failed: %s", strerror(err));
 			goto port_error;
 		}
+
+		if (port_attr.link_layer != IBV_LINK_LAYER_ETHERNET) {
+			ERROR("port %d is not configured in Ethernet mode",
+			      port);
+			goto port_error;
+		}
+
 		if (port_attr.state != IBV_PORT_ACTIVE)
 			DEBUG("port %d is not active: \"%s\" (%d)",
 			      port, ibv_port_state_str(port_attr.state),
@@ -5645,22 +5893,16 @@ error:
 
 static const struct rte_pci_id mlx4_pci_id_map[] = {
 	{
-		.vendor_id = PCI_VENDOR_ID_MELLANOX,
-		.device_id = PCI_DEVICE_ID_MELLANOX_CONNECTX3,
-		.subsystem_vendor_id = PCI_ANY_ID,
-		.subsystem_device_id = PCI_ANY_ID
+		RTE_PCI_DEVICE(PCI_VENDOR_ID_MELLANOX,
+			       PCI_DEVICE_ID_MELLANOX_CONNECTX3)
 	},
 	{
-		.vendor_id = PCI_VENDOR_ID_MELLANOX,
-		.device_id = PCI_DEVICE_ID_MELLANOX_CONNECTX3PRO,
-		.subsystem_vendor_id = PCI_ANY_ID,
-		.subsystem_device_id = PCI_ANY_ID
+		RTE_PCI_DEVICE(PCI_VENDOR_ID_MELLANOX,
+			       PCI_DEVICE_ID_MELLANOX_CONNECTX3PRO)
 	},
 	{
-		.vendor_id = PCI_VENDOR_ID_MELLANOX,
-		.device_id = PCI_DEVICE_ID_MELLANOX_CONNECTX3VF,
-		.subsystem_vendor_id = PCI_ANY_ID,
-		.subsystem_device_id = PCI_ANY_ID
+		RTE_PCI_DEVICE(PCI_VENDOR_ID_MELLANOX,
+			       PCI_DEVICE_ID_MELLANOX_CONNECTX3VF)
 	},
 	{
 		.vendor_id = 0
@@ -5685,6 +5927,8 @@ rte_mlx4_pmd_init(const char *name, const char *args)
 {
 	(void)name;
 	(void)args;
+
+	RTE_BUILD_BUG_ON(sizeof(wr_id_t) != sizeof(uint64_t));
 	/*
 	 * RDMAV_HUGEPAGES_SAFE tells ibv_fork_init() we intend to use
 	 * huge pages. Calling ibv_fork_init() during init allows
@@ -5699,8 +5943,8 @@ rte_mlx4_pmd_init(const char *name, const char *args)
 
 static struct rte_driver rte_mlx4_driver = {
 	.type = PMD_PDEV,
-	.name = MLX4_DRIVER_NAME,
 	.init = rte_mlx4_pmd_init,
 };
 
-PMD_REGISTER_DRIVER(rte_mlx4_driver)
+PMD_REGISTER_DRIVER(rte_mlx4_driver, mlx4);
+DRIVER_REGISTER_PCI_TABLE(mlx4, mlx4_pci_id_map);

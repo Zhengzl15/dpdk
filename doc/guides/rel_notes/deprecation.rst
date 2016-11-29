@@ -8,44 +8,60 @@ API and ABI deprecation notices are to be posted here.
 Deprecation Notices
 -------------------
 
-* The following fields have been deprecated in rte_eth_stats:
-  ibadcrc, ibadlen, imcasts, fdirmatch, fdirmiss,
-  tx_pause_xon, rx_pause_xon, tx_pause_xoff, rx_pause_xoff
+* The ethdev library file will be renamed from libethdev.* to librte_ethdev.*
+  in release 16.11 in order to have a more consistent namespace.
 
-* The ethdev structures rte_eth_link, rte_eth_dev_info and rte_eth_conf
-  must be updated to support 100G link and to have a cleaner link speed API.
+* In 16.11 ABI changes are planned: the ``rte_eth_dev`` structure will be
+  extended with new function pointer ``tx_pkt_prep`` allowing verification
+  and processing of packet burst to meet HW specific requirements before
+  transmit. Also new fields will be added to the ``rte_eth_desc_lim`` structure:
+  ``nb_seg_max`` and ``nb_mtu_seg_max`` providing information about number of
+  segments limit to be transmitted by device for TSO/non-TSO packets.
 
-* ABI changes is planned for the reta field in struct rte_eth_rss_reta_entry64
-  which handles at most 256 queues (8 bits) while newer NICs support larger
-  tables (512 queues).
-  It should be integrated in release 2.3.
+* The ethdev hotplug API is going to be moved to EAL with a notification
+  mechanism added to crypto and ethdev libraries so that hotplug is now
+  available to both of them. This API will be stripped of the device arguments
+  so that it only cares about hotplugging.
 
-* ABI changes are planned for struct rte_eth_fdir_flow in order to support
-  extend flow director's input set. The release 2.2 does not contain these ABI
-  changes, but release 2.3 will, and no backwards compatibility is planned.
+* Structures embodying pci and vdev devices are going to be reworked to
+  integrate new common rte_device / rte_driver objects (see
+  http://dpdk.org/ml/archives/dev/2016-January/031390.html).
+  ethdev and crypto libraries will then only handle those objects so that they
+  do not need to care about the kind of devices that are being used, making it
+  easier to add new buses later.
 
-* ABI changes are planned for rte_eth_ipv4_flow and rte_eth_ipv6_flow to
-  include more fields to be matched against. The release 2.2 does not
-  contain these ABI changes, but release 2.3 will.
+* ABI changes are planned for 16.11 in the ``rte_mbuf`` structure: some fields
+  may be reordered to facilitate the writing of ``data_off``, ``refcnt``, and
+  ``nb_segs`` in one operation, because some platforms have an overhead if the
+  store address is not naturally aligned. Other mbuf fields, such as the
+  ``port`` field, may be moved or removed as part of this mbuf work.
 
-* ABI changes are planned for adding four new flow types. This impacts
-  RTE_ETH_FLOW_MAX. The release 2.2 does not contain these ABI changes,
-  but release 2.3 will.
+* The mbuf flags PKT_RX_VLAN_PKT and PKT_RX_QINQ_PKT are deprecated and
+  are respectively replaced by PKT_RX_VLAN_STRIPPED and
+  PKT_RX_QINQ_STRIPPED, that are better described. The old flags and
+  their behavior will be kept in 16.07 and will be removed in 16.11.
 
-* ABI changes are planned for rte_eth_tunnel_filter_conf. Change the fields
-  of outer_mac and inner_mac from pointer to struct in order to keep the
-  code's readability. The release 2.2 does not contain these ABI changes, but
-  release 2.3 will, and no backwards compatibility is planned.
+* mempool: The functions ``rte_mempool_count`` and ``rte_mempool_free_count``
+  will be removed in 17.02.
+  They are replaced by ``rte_mempool_avail_count`` and
+  ``rte_mempool_in_use_count`` respectively.
 
-* The scheduler statistics structure will change to allow keeping track of
-  RED actions.
+* mempool: The functions for single/multi producer/consumer are deprecated
+  and will be removed in 17.02.
+  It is replaced by ``rte_mempool_generic_get/put`` functions.
 
-* librte_pipeline: The prototype for the pipeline input port, output port
-  and table action handlers will be updated:
-  the pipeline parameter will be added, the packets mask parameter will be
-  either removed (for input port action handler) or made input-only.
+* The ``rte_ivshmem`` feature (including library and EAL code) will be removed
+  in 16.11 because it has some design issues which are not planned to be fixed.
 
-* ABI changes are planned in cmdline buffer size to allow the use of long
-  commands (such as RETA update in testpmd).  This should impact
-  CMDLINE_PARSE_RESULT_BUFSIZE, STR_TOKEN_SIZE and RDLINE_BUF_SIZE.
-  It should be integrated in release 2.3.
+* The vhost-cuse will be removed in 16.11. Since v2.1, a large majority of
+  development effort has gone to vhost-user, such as multiple-queue, live
+  migration, reconnect etc. Therefore, vhost-user should be used instead.
+
+* Driver names are quite inconsistent among each others and they will be
+  renamed to something more consistent (net and crypto prefixes) in 16.11.
+  Some of these driver names are used publicly, to create virtual devices,
+  so a deprecation notice is necessary.
+
+* API will change for ``rte_port_source_params`` and ``rte_port_sink_params``
+  structures. The member ``file_name`` data type will be changed from
+  ``char *`` to ``const char *``. This change targets release 16.11.

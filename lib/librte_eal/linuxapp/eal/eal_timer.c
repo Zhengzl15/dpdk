@@ -47,6 +47,7 @@
 #include <rte_common.h>
 #include <rte_log.h>
 #include <rte_cycles.h>
+#include <rte_lcore.h>
 #include <rte_memory.h>
 #include <rte_memzone.h>
 #include <rte_eal.h>
@@ -221,8 +222,8 @@ rte_eal_hpet_init(int make_default)
 	snprintf(thread_name, RTE_MAX_THREAD_NAME_LEN, "hpet-msb-inc");
 	ret = rte_thread_setname(msb_inc_thread_id, thread_name);
 	if (ret != 0)
-		RTE_LOG(ERR, EAL,
-			"ERROR: Cannot set HPET timer thread name!\n");
+		RTE_LOG(DEBUG, EAL,
+			"Cannot set HPET timer thread name!\n");
 
 	if (make_default)
 		eal_timer_source = EAL_TIMER_HPET;
@@ -271,7 +272,7 @@ get_tsc_freq(void)
 #ifdef CLOCK_MONOTONIC_RAW
 #define NS_PER_SEC 1E9
 
-	struct timespec sleeptime = {.tv_nsec = 5E8 }; /* 1/2 second */
+	struct timespec sleeptime = {.tv_nsec = NS_PER_SEC / 10 }; /* 1/10 second */
 
 	struct timespec t_start, t_end;
 	uint64_t tsc_hz;

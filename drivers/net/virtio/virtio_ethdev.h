@@ -42,8 +42,6 @@
 #define SPEED_100	100
 #define SPEED_1000	1000
 #define SPEED_10G	10000
-#define HALF_DUPLEX	1
-#define FULL_DUPLEX	2
 
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
@@ -64,7 +62,8 @@
 	 1u << VIRTIO_NET_F_CTRL_VQ	  |	\
 	 1u << VIRTIO_NET_F_CTRL_RX	  |	\
 	 1u << VIRTIO_NET_F_CTRL_VLAN	  |	\
-	 1u << VIRTIO_NET_F_MRG_RXBUF)
+	 1u << VIRTIO_NET_F_MRG_RXBUF	  |	\
+	 1ULL << VIRTIO_F_VERSION_1)
 
 /*
  * CQ function prototype
@@ -82,7 +81,7 @@ int virtio_dev_queue_setup(struct rte_eth_dev *dev,
 			uint16_t vtpci_queue_idx,
 			uint16_t nb_desc,
 			unsigned int socket_id,
-			struct virtqueue **pvq);
+			void **pvq);
 
 void virtio_dev_queue_release(struct virtqueue *vq);
 
@@ -113,6 +112,8 @@ uint16_t virtio_recv_pkts_vec(void *rx_queue, struct rte_mbuf **rx_pkts,
 
 uint16_t virtio_xmit_pkts_simple(void *tx_queue, struct rte_mbuf **tx_pkts,
 		uint16_t nb_pkts);
+
+int eth_virtio_dev_init(struct rte_eth_dev *eth_dev);
 
 /*
  * The VIRTIO_NET_F_GUEST_TSO[46] features permit the host to send us

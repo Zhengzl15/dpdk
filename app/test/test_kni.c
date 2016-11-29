@@ -237,7 +237,7 @@ test_kni_allocate_lcores(void)
 	}
 	printf("count: %u\n", count);
 
-	return (count == 2 ? 0 : -1);
+	return count == 2 ? 0 : -1;
 }
 
 static int
@@ -633,8 +633,4 @@ fail:
 	return ret;
 }
 
-static struct test_command kni_cmd = {
-	.command = "kni_autotest",
-	.callback = test_kni,
-};
-REGISTER_TEST_COMMAND(kni_cmd);
+REGISTER_TEST_COMMAND(kni_autotest, test_kni);

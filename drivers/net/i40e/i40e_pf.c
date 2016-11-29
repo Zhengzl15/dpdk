@@ -82,8 +82,8 @@ i40e_pf_vf_queues_mapping(struct i40e_pf_vf *vf)
 	 * VF should use scatter range queues. So, it needn't
 	 * to set QBASE in this register.
 	 */
-	I40E_WRITE_REG(hw, I40E_VSILAN_QBASE(vsi_id),
-	     I40E_VSILAN_QBASE_VSIQTABLE_ENA_MASK);
+	i40e_write_rx_ctl(hw, I40E_VSILAN_QBASE(vsi_id),
+			  I40E_VSILAN_QBASE_VSIQTABLE_ENA_MASK);
 
 	/* Set to enable VFLAN_QTABLE[] registers valid */
 	I40E_WRITE_REG(hw, I40E_VPLAN_MAPENA(vf_id),
@@ -108,7 +108,7 @@ i40e_pf_vf_queues_mapping(struct i40e_pf_vf *vf)
 			q2 = qbase + 2 * i + 1;
 
 		val = (q2 << I40E_VSILAN_QTABLE_QINDEX_1_SHIFT) + q1;
-		I40E_WRITE_REG(hw, I40E_VSILAN_QTABLE(i, vsi_id), val);
+		i40e_write_rx_ctl(hw, I40E_VSILAN_QTABLE(i, vsi_id), val);
 	}
 	I40E_WRITE_FLUSH(hw);
 
@@ -123,7 +123,8 @@ int
 i40e_pf_host_vf_reset(struct i40e_pf_vf *vf, bool do_hw_reset)
 {
 	uint32_t val, i;
-	struct i40e_hw *hw = I40E_PF_TO_HW(vf->pf);
+	struct i40e_hw *hw;
+	struct i40e_pf *pf;
 	uint16_t vf_id, abs_vf_id, vf_msix_num;
 	int ret;
 	struct i40e_virtchnl_queue_select qsel;
@@ -131,6 +132,8 @@ i40e_pf_host_vf_reset(struct i40e_pf_vf *vf, bool do_hw_reset)
 	if (vf == NULL)
 		return -EINVAL;
 
+	pf = vf->pf;
+	hw = I40E_PF_TO_HW(vf->pf);
 	vf_id = vf->vf_idx;
 	abs_vf_id = vf_id + hw->func_caps.vf_base_id;
 
@@ -224,8 +227,14 @@ i40e_pf_host_vf_reset(struct i40e_pf_vf *vf, bool do_hw_reset)
 	I40E_WRITE_FLUSH(hw);
 
 	/* Allocate resource again */
-	vf->vsi = i40e_vsi_setup(vf->pf, I40E_VSI_SRIOV,
-			vf->pf->main_vsi, vf->vf_idx);
+	if (pf->floating_veb && pf->floating_veb_list[vf_id]) {
+		vf->vsi = i40e_vsi_setup(vf->pf, I40E_VSI_SRIOV,
+					 NULL, vf->vf_idx);
+	} else {
+		vf->vsi = i40e_vsi_setup(vf->pf, I40E_VSI_SRIOV,
+					 vf->pf->main_vsi, vf->vf_idx);
+	}
+
 	if (vf->vsi == NULL) {
 		PMD_DRV_LOG(ERR, "Add vsi failed");
 		return -EFAULT;
@@ -315,6 +324,8 @@ i40e_pf_host_process_cmd_get_vf_resource(struct i40e_pf_vf *vf)
 	/* As assume Vf only has single VSI now, always return 0 */
 	vf_res->vsi_res[0].vsi_id = 0;
 	vf_res->vsi_res[0].num_queue_pairs = vf->vsi->nb_qps;
+	ether_addr_copy(&vf->mac_addr,
+		(struct ether_addr *)vf_res->vsi_res[0].default_mac_addr);
 
 send_msg:
 	i40e_pf_host_send_msg_to_vf(vf, I40E_VIRTCHNL_OP_GET_VF_RESOURCES,
@@ -808,7 +819,7 @@ i40e_pf_host_process_cmd_config_promisc_mode(
 	if (promisc->flags & I40E_FLAG_VF_UNICAST_PROMISC)
 		unicast = TRUE;
 	ret = i40e_aq_set_vsi_unicast_promiscuous(hw,
-			vf->vsi->seid, unicast, NULL);
+			vf->vsi->seid, unicast, NULL, true);
 	if (ret != I40E_SUCCESS)
 		goto send_msg;
 
@@ -911,7 +922,7 @@ i40e_pf_host_handle_vf_msg(struct rte_eth_dev *dev,
 	/* AdminQ will pass absolute VF id, transfer to internal vf id */
 	uint16_t vf_id = abs_vf_id - hw->func_caps.vf_base_id;
 
-	if (!dev || vf_id > pf->vf_num - 1 || !pf->vfs) {
+	if (vf_id > pf->vf_num - 1 || !pf->vfs) {
 		PMD_DRV_LOG(ERR, "invalid argument");
 		return;
 	}
@@ -994,11 +1005,9 @@ i40e_pf_host_handle_vf_msg(struct rte_eth_dev *dev,
 		PMD_DRV_LOG(INFO, "OP_CFG_VLAN_PVID received");
 		i40e_pf_host_process_cmd_cfg_pvid(vf, msg, msglen);
 		break;
-	 /* Don't add command supported below, which will
-	 *  return an error code.
+	/* Don't add command supported below, which will
+	 * return an error code.
 	 */
-	case I40E_VIRTCHNL_OP_FCOE:
-		PMD_DRV_LOG(ERR, "OP_FCOE received, not supported");
 	default:
 		PMD_DRV_LOG(ERR, "%u received, not supported", opcode);
 		i40e_pf_host_send_msg_to_vf(vf, opcode, I40E_ERR_PARAM,
@@ -1045,6 +1054,7 @@ i40e_pf_host_init(struct rte_eth_dev *dev)
 		ret = i40e_pf_host_vf_reset(&pf->vfs[i], 0);
 		if (ret != I40E_SUCCESS)
 			goto fail;
+		eth_random_addr(pf->vfs[i].mac_addr.addr_bytes);
 	}
 
 	/* restore irq0 */

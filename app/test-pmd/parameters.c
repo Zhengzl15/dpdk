@@ -1,7 +1,7 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright(c) 2010-2014 Intel Corporation. All rights reserved.
+ *   Copyright(c) 2010-2016 Intel Corporation. All rights reserved.
  *   All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
@@ -526,6 +526,7 @@ launch_args_parse(int argc, char** argv)
 		{ "pkt-filter-drop-queue",      1, 0, 0 },
 		{ "crc-strip",                  0, 0, 0 },
 		{ "enable-rx-cksum",            0, 0, 0 },
+		{ "enable-scatter",             0, 0, 0 },
 		{ "disable-hw-vlan",            0, 0, 0 },
 		{ "disable-hw-vlan-filter",     0, 0, 0 },
 		{ "disable-hw-vlan-strip",      0, 0, 0 },
@@ -764,6 +765,8 @@ launch_args_parse(int argc, char** argv)
 			}
 			if (!strcmp(lgopts[opt_idx].name, "crc-strip"))
 				rx_mode.hw_strip_crc = 1;
+			if (!strcmp(lgopts[opt_idx].name, "enable-scatter"))
+				rx_mode.enable_scatter = 1;
 			if (!strcmp(lgopts[opt_idx].name, "enable-rx-cksum"))
 				rx_mode.hw_ip_checksum = 1;
 
@@ -810,21 +813,25 @@ launch_args_parse(int argc, char** argv)
 				rss_hf = ETH_RSS_UDP;
 			if (!strcmp(lgopts[opt_idx].name, "rxq")) {
 				n = atoi(optarg);
-				if (n >= 1 && n <= (int) MAX_QUEUE_ID)
+				if (n >= 0 && n <= (int) MAX_QUEUE_ID)
 					nb_rxq = (queueid_t) n;
 				else
 					rte_exit(EXIT_FAILURE, "rxq %d invalid - must be"
-						  " >= 1 && <= %d\n", n,
+						  " >= 0 && <= %d\n", n,
 						  (int) MAX_QUEUE_ID);
 			}
 			if (!strcmp(lgopts[opt_idx].name, "txq")) {
 				n = atoi(optarg);
-				if (n >= 1 && n <= (int) MAX_QUEUE_ID)
+				if (n >= 0 && n <= (int) MAX_QUEUE_ID)
 					nb_txq = (queueid_t) n;
 				else
 					rte_exit(EXIT_FAILURE, "txq %d invalid - must be"
-						  " >= 1 && <= %d\n", n,
+						  " >= 0 && <= %d\n", n,
 						  (int) MAX_QUEUE_ID);
+			}
+			if (!nb_rxq && !nb_txq) {
+				rte_exit(EXIT_FAILURE, "Either rx or tx queues should "
+						"be non-zero\n");
 			}
 			if (!strcmp(lgopts[opt_idx].name, "burst")) {
 				n = atoi(optarg);

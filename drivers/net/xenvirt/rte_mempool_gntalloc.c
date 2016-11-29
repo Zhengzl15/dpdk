@@ -78,7 +78,7 @@ static struct _mempool_gntalloc_info
 _create_mempool(const char *name, unsigned elt_num, unsigned elt_size,
 		   unsigned cache_size, unsigned private_data_size,
 		   rte_mempool_ctor_t *mp_init, void *mp_init_arg,
-		   rte_mempool_obj_ctor_t *obj_init, void *obj_init_arg,
+		   rte_mempool_obj_cb_t *obj_init, void *obj_init_arg,
 		   int socket_id, unsigned flags)
 {
 	struct _mempool_gntalloc_info mgi;
@@ -202,7 +202,7 @@ _create_mempool(const char *name, unsigned elt_num, unsigned elt_size,
 				obj_init, obj_init_arg,
 				socket_id, flags, va, pa_arr, rpg_num, pg_shift);
 
-		RTE_VERIFY(elt_num == mp->size);
+		RTE_ASSERT(elt_num == mp->size);
 	}
 	mgi.mp = mp;
 	mgi.pg_num = rpg_num;
@@ -229,15 +229,12 @@ mmap_failed:
 			munmap(gnt_arr[i].va, pg_sz);
 	}
 out:
-	if (gnt_arr)
-		free(gnt_arr);
+	free(gnt_arr);
 	if (orig_va)
 		munmap(orig_va, sz);
 	if (mp == NULL) {
-		if (gref_arr)
-			free(gref_arr);
-		if (pa_arr)
-			free(pa_arr);
+		free(gref_arr);
+		free(pa_arr);
 
 		/* some gref has already been de-allocated from the list in the driver,
 		 * so dealloc one by one, and it is safe to deallocate twice
@@ -256,7 +253,7 @@ struct rte_mempool *
 rte_mempool_gntalloc_create(const char *name, unsigned elt_num, unsigned elt_size,
 		   unsigned cache_size, unsigned private_data_size,
 		   rte_mempool_ctor_t *mp_init, void *mp_init_arg,
-		   rte_mempool_obj_ctor_t *obj_init, void *obj_init_arg,
+		   rte_mempool_obj_cb_t *obj_init, void *obj_init_arg,
 		   int socket_id, unsigned flags)
 {
 	int rv;

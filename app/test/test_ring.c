@@ -100,8 +100,6 @@
 
 #define RING_SIZE 4096
 #define MAX_BULK 32
-#define N 65536
-#define TIME_S 5
 
 static rte_atomic32_t synchro;
 
@@ -112,7 +110,7 @@ static struct rte_ring *r;
 		printf("error at %s:%d\tcondition " #exp " failed\n",	\
 		    __func__, __LINE__);				\
 		rte_ring_dump(stdout, r);				\
-		return (-1);						\
+		return -1;						\
 	}
 
 #define	TEST_RING_FULL_EMTPY_ITER	8
@@ -130,7 +128,7 @@ check_live_watermark_change(__attribute__((unused)) void *dummy)
 
 	/* init the object table */
 	memset(obj_table, 0, sizeof(obj_table));
-	end_time = rte_get_timer_cycles() + (hz * 2);
+	end_time = rte_get_timer_cycles() + (hz / 4);
 
 	/* check that bulk and watermark are 4 and 32 (respectively) */
 	while (diff >= 0) {
@@ -194,9 +192,9 @@ test_live_watermark_change(void)
 	 * watermark and quota */
 	rte_eal_remote_launch(check_live_watermark_change, NULL, lcore_id2);
 
-	rte_delay_ms(1000);
+	rte_delay_ms(100);
 	rte_ring_set_water_mark(r, 32);
-	rte_delay_ms(1000);
+	rte_delay_ms(100);
 
 	if (rte_eal_wait_lcore(lcore_id2) < 0)
 		return -1;
@@ -274,7 +272,7 @@ test_ring_basic_full_empty(void * const src[], void *dst[])
 		TEST_RING_VERIFY(0 == memcmp(src, dst, rsz));
 		rte_ring_dump(stdout, r);
 	}
-	return (0);
+	return 0;
 }
 
 static int
@@ -471,17 +469,13 @@ test_ring_basic(void)
 	if (ret != 0)
 		goto fail;
 
-	if (src)
-		free(src);
-	if (dst)
-		free(dst);
+	free(src);
+	free(dst);
 	return 0;
 
  fail:
-	if (src)
-		free(src);
-	if (dst)
-		free(dst);
+	free(src);
+	free(dst);
 	return -1;
 }
 
@@ -759,17 +753,13 @@ test_ring_burst_basic(void)
 		goto fail;
 
 	/* Free memory before test completed */
-	if (src)
-		free(src);
-	if (dst)
-		free(dst);
+	free(src);
+	free(dst);
 	return 0;
 
  fail:
-	if (src)
-		free(src);
-	if (dst)
-		free(dst);
+	free(src);
+	free(dst);
 	return -1;
 }
 
@@ -1168,17 +1158,13 @@ test_ring_stats(void)
 	memset(&r->stats[lcore_id], 0, sizeof(r->stats[lcore_id]));
 
 	/* Free memory before test completed */
-	if (src)
-		free(src);
-	if (dst)
-		free(dst);
+	free(src);
+	free(dst);
 	return 0;
 
 fail:
-	if (src)
-		free(src);
-	if (dst)
-		free(dst);
+	free(src);
+	free(dst);
 	return -1;
 #endif
 }
@@ -1392,8 +1378,4 @@ test_ring(void)
 	return 0;
 }
 
-static struct test_command ring_cmd = {
-	.command = "ring_autotest",
-	.callback = test_ring,
-};
-REGISTER_TEST_COMMAND(ring_cmd);
+REGISTER_TEST_COMMAND(ring_autotest, test_ring);

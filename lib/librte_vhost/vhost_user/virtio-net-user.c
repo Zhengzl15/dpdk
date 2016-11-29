@@ -34,16 +34,15 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <unistd.h>
 
 #include <rte_common.h>
 #include <rte_log.h>
 
-#include "virtio-net.h"
 #include "virtio-net-user.h"
 #include "vhost-net-user.h"
 #include "vhost-net.h"
@@ -64,9 +63,10 @@ static uint64_t
 get_blk_size(int fd)
 {
 	struct stat stat;
+	int ret;
 
-	fstat(fd, &stat);
-	return (uint64_t)stat.st_blksize;
+	ret = fstat(fd, &stat);
+	return ret == -1 ? (uint64_t)-1 : (uint64_t)stat.st_blksize;
 }
 
 static void
@@ -88,8 +88,22 @@ free_mem_region(struct virtio_net *dev)
 	}
 }
 
+void
+vhost_backend_cleanup(struct virtio_net *dev)
+{
+	if (dev->mem) {
+		free_mem_region(dev);
+		free(dev->mem);
+		dev->mem = NULL;
+	}
+	if (dev->log_addr) {
+		munmap((void *)(uintptr_t)dev->log_addr, dev->log_size);
+		dev->log_addr = 0;
+	}
+}
+
 int
-user_set_mem_table(struct vhost_device_ctx ctx, struct VhostUserMsg *pmsg)
+user_set_mem_table(int vid, struct VhostUserMsg *pmsg)
 {
 	struct VhostUserMemory memory = pmsg->payload.memory;
 	struct virtio_memory_regions *pregion;
@@ -100,13 +114,15 @@ user_set_mem_table(struct vhost_device_ctx ctx, struct VhostUserMsg *pmsg)
 	uint64_t alignment;
 
 	/* unmap old memory regions one by one*/
-	dev = get_device(ctx);
+	dev = get_device(vid);
 	if (dev == NULL)
 		return -1;
 
 	/* Remove from the data plane. */
-	if (dev->flags & VIRTIO_DEV_RUNNING)
-		notify_ops->destroy_device(dev);
+	if (dev->flags & VIRTIO_DEV_RUNNING) {
+		dev->flags &= ~VIRTIO_DEV_RUNNING;
+		notify_ops->destroy_device(vid);
+	}
 
 	if (dev->mem) {
 		free_mem_region(dev);
@@ -120,8 +136,8 @@ user_set_mem_table(struct vhost_device_ctx ctx, struct VhostUserMsg *pmsg)
 		sizeof(struct orig_region_map) * memory.nregions);
 	if (dev->mem == NULL) {
 		RTE_LOG(ERR, VHOST_CONFIG,
-			"(%"PRIu64") Failed to allocate memory for dev->mem\n",
-			dev->device_fh);
+			"(%d) failed to allocate memory for dev->mem\n",
+			dev->vid);
 		return -1;
 	}
 	dev->mem->nregions = memory.nregions;
@@ -152,6 +168,11 @@ user_set_mem_table(struct vhost_device_ctx ctx, struct VhostUserMsg *pmsg)
 		 * aligned.
 		 */
 		alignment = get_blk_size(pmsg->fds[idx]);
+		if (alignment == (uint64_t)-1) {
+			RTE_LOG(ERR, VHOST_CONFIG,
+				"couldn't get hugepage size through fstat\n");
+			goto err_mmap;
+		}
 		mapped_size = RTE_ALIGN_CEIL(mapped_size, alignment);
 
 		mapped_address = (uint64_t)(uintptr_t)mmap(NULL,
@@ -215,8 +236,8 @@ static int
 vq_is_ready(struct vhost_virtqueue *vq)
 {
 	return vq && vq->desc   &&
-	       vq->kickfd != -1 &&
-	       vq->callfd != -1;
+	       vq->kickfd != VIRTIO_UNINITIALIZED_EVENTFD &&
+	       vq->callfd != VIRTIO_UNINITIALIZED_EVENTFD;
 }
 
 static int
@@ -242,18 +263,18 @@ virtio_is_ready(struct virtio_net *dev)
 }
 
 void
-user_set_vring_call(struct vhost_device_ctx ctx, struct VhostUserMsg *pmsg)
+user_set_vring_call(int vid, struct VhostUserMsg *pmsg)
 {
 	struct vhost_vring_file file;
 
 	file.index = pmsg->payload.u64 & VHOST_USER_VRING_IDX_MASK;
 	if (pmsg->payload.u64 & VHOST_USER_VRING_NOFD_MASK)
-		file.fd = -1;
+		file.fd = VIRTIO_INVALID_EVENTFD;
 	else
 		file.fd = pmsg->fds[0];
 	RTE_LOG(INFO, VHOST_CONFIG,
 		"vring call idx:%d file:%d\n", file.index, file.fd);
-	ops->set_vring_call(ctx, &file);
+	vhost_set_vring_call(vid, &file);
 }
 
 
@@ -262,42 +283,47 @@ user_set_vring_call(struct vhost_device_ctx ctx, struct VhostUserMsg *pmsg)
  *  device is ready for packet processing.
  */
 void
-user_set_vring_kick(struct vhost_device_ctx ctx, struct VhostUserMsg *pmsg)
+user_set_vring_kick(int vid, struct VhostUserMsg *pmsg)
 {
 	struct vhost_vring_file file;
-	struct virtio_net *dev = get_device(ctx);
+	struct virtio_net *dev = get_device(vid);
+
+	if (!dev)
+		return;
 
 	file.index = pmsg->payload.u64 & VHOST_USER_VRING_IDX_MASK;
 	if (pmsg->payload.u64 & VHOST_USER_VRING_NOFD_MASK)
-		file.fd = -1;
+		file.fd = VIRTIO_INVALID_EVENTFD;
 	else
 		file.fd = pmsg->fds[0];
 	RTE_LOG(INFO, VHOST_CONFIG,
 		"vring kick idx:%d file:%d\n", file.index, file.fd);
-	ops->set_vring_kick(ctx, &file);
+	vhost_set_vring_kick(vid, &file);
 
-	if (virtio_is_ready(dev) &&
-		!(dev->flags & VIRTIO_DEV_RUNNING))
-			notify_ops->new_device(dev);
+	if (virtio_is_ready(dev) && !(dev->flags & VIRTIO_DEV_RUNNING)) {
+		if (notify_ops->new_device(vid) == 0)
+			dev->flags |= VIRTIO_DEV_RUNNING;
+	}
 }
 
 /*
  * when virtio is stopped, qemu will send us the GET_VRING_BASE message.
  */
 int
-user_get_vring_base(struct vhost_device_ctx ctx,
-	struct vhost_vring_state *state)
+user_get_vring_base(int vid, struct vhost_vring_state *state)
 {
-	struct virtio_net *dev = get_device(ctx);
+	struct virtio_net *dev = get_device(vid);
 
 	if (dev == NULL)
 		return -1;
 	/* We have to stop the queue (virtio) if it is running. */
-	if (dev->flags & VIRTIO_DEV_RUNNING)
-		notify_ops->destroy_device(dev);
+	if (dev->flags & VIRTIO_DEV_RUNNING) {
+		dev->flags &= ~VIRTIO_DEV_RUNNING;
+		notify_ops->destroy_device(vid);
+	}
 
 	/* Here we are safe to get the last used index */
-	ops->get_vring_base(ctx, state->index, state);
+	vhost_get_vring_base(vid, state->index, state);
 
 	RTE_LOG(INFO, VHOST_CONFIG,
 		"vring base idx:%d file:%d\n", state->index, state->num);
@@ -306,10 +332,10 @@ user_get_vring_base(struct vhost_device_ctx ctx,
 	 * sent and only sent in vhost_vring_stop.
 	 * TODO: cleanup the vring, it isn't usable since here.
 	 */
-	if (dev->virtqueue[state->index]->kickfd >= 0) {
+	if (dev->virtqueue[state->index]->kickfd >= 0)
 		close(dev->virtqueue[state->index]->kickfd);
-		dev->virtqueue[state->index]->kickfd = -1;
-	}
+
+	dev->virtqueue[state->index]->kickfd = VIRTIO_UNINITIALIZED_EVENTFD;
 
 	return 0;
 }
@@ -319,19 +345,21 @@ user_get_vring_base(struct vhost_device_ctx ctx,
  * enable the virtio queue pair.
  */
 int
-user_set_vring_enable(struct vhost_device_ctx ctx,
-		      struct vhost_vring_state *state)
+user_set_vring_enable(int vid, struct vhost_vring_state *state)
 {
-	struct virtio_net *dev = get_device(ctx);
+	struct virtio_net *dev;
 	int enable = (int)state->num;
+
+	dev = get_device(vid);
+	if (dev == NULL)
+		return -1;
 
 	RTE_LOG(INFO, VHOST_CONFIG,
 		"set queue enable: %d to qp idx: %d\n",
 		enable, state->index);
 
-	if (notify_ops->vring_state_changed) {
-		notify_ops->vring_state_changed(dev, state->index, enable);
-	}
+	if (notify_ops->vring_state_changed)
+		notify_ops->vring_state_changed(vid, state->index, enable);
 
 	dev->virtqueue[state->index]->enabled = enable;
 
@@ -339,29 +367,104 @@ user_set_vring_enable(struct vhost_device_ctx ctx,
 }
 
 void
-user_destroy_device(struct vhost_device_ctx ctx)
-{
-	struct virtio_net *dev = get_device(ctx);
-
-	if (dev && (dev->flags & VIRTIO_DEV_RUNNING))
-		notify_ops->destroy_device(dev);
-
-	if (dev && dev->mem) {
-		free_mem_region(dev);
-		free(dev->mem);
-		dev->mem = NULL;
-	}
-}
-
-void
-user_set_protocol_features(struct vhost_device_ctx ctx,
-			   uint64_t protocol_features)
+user_set_protocol_features(int vid, uint64_t protocol_features)
 {
 	struct virtio_net *dev;
 
-	dev = get_device(ctx);
+	dev = get_device(vid);
 	if (dev == NULL || protocol_features & ~VHOST_USER_PROTOCOL_FEATURES)
 		return;
 
 	dev->protocol_features = protocol_features;
+}
+
+int
+user_set_log_base(int vid, struct VhostUserMsg *msg)
+{
+	struct virtio_net *dev;
+	int fd = msg->fds[0];
+	uint64_t size, off;
+	void *addr;
+
+	dev = get_device(vid);
+	if (!dev)
+		return -1;
+
+	if (fd < 0) {
+		RTE_LOG(ERR, VHOST_CONFIG, "invalid log fd: %d\n", fd);
+		return -1;
+	}
+
+	if (msg->size != sizeof(VhostUserLog)) {
+		RTE_LOG(ERR, VHOST_CONFIG,
+			"invalid log base msg size: %"PRId32" != %d\n",
+			msg->size, (int)sizeof(VhostUserLog));
+		return -1;
+	}
+
+	size = msg->payload.log.mmap_size;
+	off  = msg->payload.log.mmap_offset;
+	RTE_LOG(INFO, VHOST_CONFIG,
+		"log mmap size: %"PRId64", offset: %"PRId64"\n",
+		size, off);
+
+	/*
+	 * mmap from 0 to workaround a hugepage mmap bug: mmap will
+	 * fail when offset is not page size aligned.
+	 */
+	addr = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	if (addr == MAP_FAILED) {
+		RTE_LOG(ERR, VHOST_CONFIG, "mmap log base failed!\n");
+		return -1;
+	}
+
+	/*
+	 * Free previously mapped log memory on occasionally
+	 * multiple VHOST_USER_SET_LOG_BASE.
+	 */
+	if (dev->log_addr) {
+		munmap((void *)(uintptr_t)dev->log_addr, dev->log_size);
+	}
+	dev->log_addr = (uint64_t)(uintptr_t)addr;
+	dev->log_base = dev->log_addr + off;
+	dev->log_size = size;
+
+	return 0;
+}
+
+/*
+ * An rarp packet is constructed and broadcasted to notify switches about
+ * the new location of the migrated VM, so that packets from outside will
+ * not be lost after migration.
+ *
+ * However, we don't actually "send" a rarp packet here, instead, we set
+ * a flag 'broadcast_rarp' to let rte_vhost_dequeue_burst() inject it.
+ */
+int
+user_send_rarp(int vid, struct VhostUserMsg *msg)
+{
+	struct virtio_net *dev;
+	uint8_t *mac = (uint8_t *)&msg->payload.u64;
+
+	dev = get_device(vid);
+	if (!dev)
+		return -1;
+
+	RTE_LOG(DEBUG, VHOST_CONFIG,
+		":: mac: %02x:%02x:%02x:%02x:%02x:%02x\n",
+		mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+	memcpy(dev->mac.addr_bytes, mac, 6);
+
+	/*
+	 * Set the flag to inject a RARP broadcast packet at
+	 * rte_vhost_dequeue_burst().
+	 *
+	 * rte_smp_wmb() is for making sure the mac is copied
+	 * before the flag is set.
+	 */
+	rte_smp_wmb();
+	rte_atomic16_set(&dev->broadcast_rarp, 1);
+
+	return 0;
 }

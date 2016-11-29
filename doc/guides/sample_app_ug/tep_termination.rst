@@ -59,8 +59,8 @@ This allows network isolation, QOS, etc to be provided on a per client basis.
 In a typical setup, the network overlay tunnel is terminated at the Virtual/Tunnel End Point (VEP/TEP).
 The TEP is normally located at the physical host level ideally in the software switch.
 Due to processing constraints and the inevitable bottleneck that the switch
-becomes the ability to offload overlay support features becomes an important requirement.
-Intel® XL710 10/40 G Ethernet network card provides hardware filtering
+becomes, the ability to offload overlay support features becomes an important requirement.
+Intel® XL710 10/40 Gigabit Ethernet network card provides hardware filtering
 and offload capabilities to support overlay networks implementations such as MAC in UDP and MAC in GRE.
 
 Sample Code Overview
@@ -121,7 +121,7 @@ The example in this section have been validated with the following distributions
 Prerequisites
 -------------
 
-Refer to the guide in section 27.4 in the vhost sample.
+Refer to :ref:`vhost_app_prerequisites`.
 
 Compiling the Sample Code
 -------------------------
@@ -131,14 +131,14 @@ Compiling the Sample Code
 
     .. code-block:: console
 
-        CONFIG_RTE_LIBRTE_VHOST=n
+        CONFIG_RTE_LIBRTE_VHOST=y
 
     vhost user is turned on by default in the configure file config/common_linuxapp.
     To enable vhost cuse, disable vhost user.
 
     .. code-block:: console
 
-        CONFIG_RTE_LIBRTE_VHOST_USER=y
+        CONFIG_RTE_LIBRTE_VHOST_USER=n
 
      After vhost is enabled and the implementation is selected, build the vhost library.
 
@@ -225,7 +225,7 @@ Parameters
 
 **The same parameters with the vhost sample.**
 
-Refer to the guide in section 27.6.1 in the vhost sample for the meanings of 'Basename',
+Refer to :ref:`vhost_app_parameters` for the meanings of 'Basename',
 'Stats', 'RX Retry', 'RX Retry Number' and 'RX Retry Delay Time'.
 
 **Number of Devices.**
@@ -303,12 +303,12 @@ The default value is 1.
 Running the Virtual Machine (QEMU)
 ----------------------------------
 
-Refer to the guide in section 27.7 in the vhost sample.
+Refer to :ref:`vhost_app_running`.
 
 Running DPDK in the Virtual Machine
 -----------------------------------
 
-Refer to the guide in section 27.8 in the vHost sample.
+Refer to :ref:`vhost_app_running_dpdk`.
 
 Passing Traffic to the Virtual Machine Device
 ---------------------------------------------

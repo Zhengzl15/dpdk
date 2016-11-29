@@ -48,8 +48,7 @@ static void free_devargs_list(void)
 	while (!TAILQ_EMPTY(&devargs_list)) {
 		devargs = TAILQ_FIRST(&devargs_list);
 		TAILQ_REMOVE(&devargs_list, devargs, next);
-		if (devargs->args)
-			free(devargs->args);
+		free(devargs->args);
 		free(devargs);
 	}
 }
@@ -132,8 +131,4 @@ test_devargs(void)
 	return -1;
 }
 
-static struct test_command devargs_cmd = {
-	.command = "devargs_autotest",
-	.callback = test_devargs,
-};
-REGISTER_TEST_COMMAND(devargs_cmd);
+REGISTER_TEST_COMMAND(devargs_autotest, test_devargs);

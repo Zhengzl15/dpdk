@@ -1,7 +1,7 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright(c) 2010-2015 Intel Corporation. All rights reserved.
+ *   Copyright(c) 2010-2016 Intel Corporation. All rights reserved.
  *   All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
@@ -55,6 +55,8 @@
 
 #define APP_NAME_SIZE	32
 
+#define APP_RETA_SIZE_MAX     (ETH_RSS_RETA_SIZE_512 / RTE_RETA_GROUP_SIZE)
+
 static void
 app_init_core_map(struct app_params *app)
 {
@@ -96,9 +98,10 @@ app_init_core_mask(struct app_params *app)
 static void
 app_init_eal(struct app_params *app)
 {
-	char buffer[32];
+	char buffer[256];
 	struct app_eal_params *p = &app->eal_params;
 	uint32_t n_args = 0;
+	uint32_t i;
 	int status;
 
 	app->eal_argv[n_args++] = strdup(app->app_name);
@@ -132,24 +135,47 @@ app_init_eal(struct app_params *app)
 		app->eal_argv[n_args++] = strdup(buffer);
 	}
 
-	if (p->pci_blacklist) {
+	for (i = 0; i < APP_MAX_LINKS; i++) {
+		if (p->pci_blacklist[i] == NULL)
+			break;
+
 		snprintf(buffer,
 			sizeof(buffer),
 			"--pci-blacklist=%s",
-			p->pci_blacklist);
+			p->pci_blacklist[i]);
 		app->eal_argv[n_args++] = strdup(buffer);
 	}
 
-	if (p->pci_whitelist) {
+	if (app->port_mask != 0)
+		for (i = 0; i < APP_MAX_LINKS; i++) {
+			if (p->pci_whitelist[i] == NULL)
+				break;
+
+			snprintf(buffer,
+				sizeof(buffer),
+				"--pci-whitelist=%s",
+				p->pci_whitelist[i]);
+			app->eal_argv[n_args++] = strdup(buffer);
+		}
+	else
+		for (i = 0; i < app->n_links; i++) {
+			char *pci_bdf = app->link_params[i].pci_bdf;
+
+			snprintf(buffer,
+				sizeof(buffer),
+				"--pci-whitelist=%s",
+				pci_bdf);
+			app->eal_argv[n_args++] = strdup(buffer);
+		}
+
+	for (i = 0; i < APP_MAX_LINKS; i++) {
+		if (p->vdev[i] == NULL)
+			break;
+
 		snprintf(buffer,
 			sizeof(buffer),
-			"--pci-whitelist=%s",
-			p->pci_whitelist);
-		app->eal_argv[n_args++] = strdup(buffer);
-	}
-
-	if (p->vdev) {
-		snprintf(buffer, sizeof(buffer), "--vdev=%s", p->vdev);
+			"--vdev=%s",
+			p->vdev[i]);
 		app->eal_argv[n_args++] = strdup(buffer);
 	}
 
@@ -267,6 +293,15 @@ app_init_eal(struct app_params *app)
 	app->eal_argc = n_args;
 
 	APP_LOG(app, HIGH, "Initializing EAL ...");
+	if (app->log_level >= APP_LOG_LEVEL_LOW) {
+		int i;
+
+		fprintf(stdout, "[APP] EAL arguments: \"");
+		for (i = 1; i < app->eal_argc; i++)
+			fprintf(stdout, "%s ", app->eal_argv[i]);
+		fprintf(stdout, "\"\n");
+	}
+
 	status = rte_eal_init(app->eal_argc, app->eal_argv);
 	if (status < 0)
 		rte_panic("EAL init error\n");
@@ -317,7 +352,7 @@ app_link_filter_tcp_syn_add(struct app_link_params *link)
 {
 	struct rte_eth_syn_filter filter = {
 		.hig_pri = 1,
-		.queue = link->tcp_syn_local_q,
+		.queue = link->tcp_syn_q,
 	};
 
 	return rte_eth_dev_filter_ctrl(link->pmd_id,
@@ -555,20 +590,32 @@ app_link_set_arp_filter(struct app_params *app, struct app_link_params *cp)
 static void
 app_link_set_tcp_syn_filter(struct app_params *app, struct app_link_params *cp)
 {
-	if (cp->tcp_syn_local_q != 0) {
+	if (cp->tcp_syn_q != 0) {
 		int status = app_link_filter_tcp_syn_add(cp);
 
 		APP_LOG(app, LOW, "%s (%" PRIu32 "): "
 			"Adding TCP SYN filter (queue = %" PRIu32 ")",
-			cp->name, cp->pmd_id, cp->tcp_syn_local_q);
+			cp->name, cp->pmd_id, cp->tcp_syn_q);
 
 		if (status)
 			rte_panic("%s (%" PRIu32 "): "
 				"Error adding TCP SYN filter "
 				"(queue = %" PRIu32 ") (%" PRId32 ")\n",
-				cp->name, cp->pmd_id, cp->tcp_syn_local_q,
+				cp->name, cp->pmd_id, cp->tcp_syn_q,
 				status);
 	}
+}
+
+static int
+app_link_is_virtual(struct app_link_params *p)
+{
+	uint32_t pmd_id = p->pmd_id;
+	struct rte_eth_dev *dev = &rte_eth_devices[pmd_id];
+
+	if (dev->dev_type == RTE_ETH_DEV_VIRTUAL)
+		return 1;
+
+	return 0;
 }
 
 void
@@ -576,6 +623,11 @@ app_link_up_internal(struct app_params *app, struct app_link_params *cp)
 {
 	uint32_t i;
 	int status;
+
+	if (app_link_is_virtual(cp)) {
+		cp->state = 1;
+		return;
+	}
 
 	/* For each link, add filters for IP of current link */
 	if (cp->ip != 0) {
@@ -671,8 +723,8 @@ app_link_up_internal(struct app_params *app, struct app_link_params *cp)
 	/* PMD link up */
 	status = rte_eth_dev_set_link_up(cp->pmd_id);
 	if (status < 0)
-		rte_panic("%s (%" PRIu32 "): PMD set up error %" PRId32 "\n",
-			cp->name, cp->pmd_id, status);
+		rte_panic("%s (%" PRIu32 "): PMD set link up error %"
+			PRId32 "\n", cp->name, cp->pmd_id, status);
 
 	/* Mark link as UP */
 	cp->state = 1;
@@ -682,9 +734,18 @@ void
 app_link_down_internal(struct app_params *app, struct app_link_params *cp)
 {
 	uint32_t i;
+	int status;
+
+	if (app_link_is_virtual(cp)) {
+		cp->state = 0;
+		return;
+	}
 
 	/* PMD link down */
-	rte_eth_dev_set_link_down(cp->pmd_id);
+	status = rte_eth_dev_set_link_down(cp->pmd_id);
+	if (status < 0)
+		rte_panic("%s (%" PRIu32 "): PMD set link down error %"
+			PRId32 "\n", cp->name, cp->pmd_id, status);
 
 	/* Mark link as DOWN */
 	cp->state = 0;
@@ -797,7 +858,7 @@ app_check_link(struct app_params *app)
 			link_params.link_speed / 1000,
 			link_params.link_status ? "UP" : "DOWN");
 
-		if (link_params.link_status == 0)
+		if (link_params.link_status == ETH_LINK_DOWN)
 			all_links_up = 0;
 	}
 
@@ -835,6 +896,75 @@ app_init_link_frag_ras(struct app_params *app)
 	}
 }
 
+static inline int
+app_get_cpu_socket_id(uint32_t pmd_id)
+{
+	int status = rte_eth_dev_socket_id(pmd_id);
+
+	return (status != SOCKET_ID_ANY) ? status : 0;
+}
+
+static inline int
+app_link_rss_enabled(struct app_link_params *cp)
+{
+	return (cp->n_rss_qs) ? 1 : 0;
+}
+
+static void
+app_link_rss_setup(struct app_link_params *cp)
+{
+	struct rte_eth_dev_info dev_info;
+	struct rte_eth_rss_reta_entry64 reta_conf[APP_RETA_SIZE_MAX];
+	uint32_t i;
+	int status;
+
+    /* Get RETA size */
+	memset(&dev_info, 0, sizeof(dev_info));
+	rte_eth_dev_info_get(cp->pmd_id, &dev_info);
+
+	if (dev_info.reta_size == 0)
+		rte_panic("%s (%u): RSS setup error (null RETA size)\n",
+			cp->name, cp->pmd_id);
+
+	if (dev_info.reta_size > ETH_RSS_RETA_SIZE_512)
+		rte_panic("%s (%u): RSS setup error (RETA size too big)\n",
+			cp->name, cp->pmd_id);
+
+	/* Setup RETA contents */
+	memset(reta_conf, 0, sizeof(reta_conf));
+
+	for (i = 0; i < dev_info.reta_size; i++)
+		reta_conf[i / RTE_RETA_GROUP_SIZE].mask = UINT64_MAX;
+
+	for (i = 0; i < dev_info.reta_size; i++) {
+		uint32_t reta_id = i / RTE_RETA_GROUP_SIZE;
+		uint32_t reta_pos = i % RTE_RETA_GROUP_SIZE;
+		uint32_t rss_qs_pos = i % cp->n_rss_qs;
+
+		reta_conf[reta_id].reta[reta_pos] =
+			(uint16_t) cp->rss_qs[rss_qs_pos];
+	}
+
+	/* RETA update */
+	status = rte_eth_dev_rss_reta_update(cp->pmd_id,
+		reta_conf,
+		dev_info.reta_size);
+	if (status != 0)
+		rte_panic("%s (%u): RSS setup error (RETA update failed)\n",
+			cp->name, cp->pmd_id);
+}
+
+static void
+app_init_link_set_config(struct app_link_params *p)
+{
+	if (p->n_rss_qs) {
+		p->conf.rxmode.mq_mode = ETH_MQ_RX_RSS;
+		p->conf.rx_adv_conf.rss_conf.rss_hf = p->rss_proto_ipv4 |
+			p->rss_proto_ipv6 |
+			p->rss_proto_l2;
+	}
+}
+
 static void
 app_init_link(struct app_params *app)
 {
@@ -850,6 +980,7 @@ app_init_link(struct app_params *app)
 		sscanf(p_link->name, "LINK%" PRIu32, &link_id);
 		n_hwq_in = app_link_get_n_rxq(app, p_link);
 		n_hwq_out = app_link_get_n_txq(app, p_link);
+		app_init_link_set_config(p_link);
 
 		APP_LOG(app, HIGH, "Initializing %s (%" PRIu32") "
 			"(%" PRIu32 " RXQ, %" PRIu32 " TXQ) ...",
@@ -890,7 +1021,7 @@ app_init_link(struct app_params *app)
 				p_link->pmd_id,
 				rxq_queue_id,
 				p_rxq->size,
-				rte_eth_dev_socket_id(p_link->pmd_id),
+				app_get_cpu_socket_id(p_link->pmd_id),
 				&p_rxq->conf,
 				app->mempool[p_rxq->mempool_id]);
 			if (status < 0)
@@ -917,7 +1048,7 @@ app_init_link(struct app_params *app)
 				p_link->pmd_id,
 				txq_queue_id,
 				p_txq->size,
-				rte_eth_dev_socket_id(p_link->pmd_id),
+				app_get_cpu_socket_id(p_link->pmd_id),
 				&p_txq->conf);
 			if (status < 0)
 				rte_panic("%s (%" PRIu32 "): "
@@ -934,9 +1065,13 @@ app_init_link(struct app_params *app)
 			rte_panic("Cannot start %s (error %" PRId32 ")\n",
 				p_link->name, status);
 
-		/* LINK UP */
+		/* LINK FILTERS */
 		app_link_set_arp_filter(app, p_link);
 		app_link_set_tcp_syn_filter(app, p_link);
+		if (app_link_rss_enabled(p_link))
+			app_link_rss_setup(p_link);
+
+		/* LINK UP */
 		app_link_up_internal(app, p_link);
 	}
 
@@ -989,7 +1124,7 @@ app_init_tm(struct app_params *app)
 		/* TM */
 		p_tm->sched_port_params.name = p_tm->name;
 		p_tm->sched_port_params.socket =
-			rte_eth_dev_socket_id(p_link->pmd_id);
+			app_get_cpu_socket_id(p_link->pmd_id);
 		p_tm->sched_port_params.rate =
 			(uint64_t) link_eth_params.link_speed * 1000 * 1000 / 8;
 
@@ -1041,6 +1176,111 @@ app_init_tm(struct app_params *app)
 	}
 }
 
+#ifdef RTE_LIBRTE_KNI
+static int
+kni_config_network_interface(uint8_t port_id, uint8_t if_up) {
+	int ret = 0;
+
+	if (port_id >= rte_eth_dev_count())
+		return -EINVAL;
+
+	ret = (if_up) ?
+		rte_eth_dev_set_link_up(port_id) :
+		rte_eth_dev_set_link_down(port_id);
+
+	return ret;
+}
+
+static int
+kni_change_mtu(uint8_t port_id, unsigned new_mtu) {
+	int ret;
+
+	if (port_id >= rte_eth_dev_count())
+		return -EINVAL;
+
+	if (new_mtu > ETHER_MAX_LEN)
+		return -EINVAL;
+
+	/* Set new MTU */
+	ret = rte_eth_dev_set_mtu(port_id, new_mtu);
+	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+#endif /* RTE_LIBRTE_KNI */
+
+#ifndef RTE_LIBRTE_KNI
+static void
+app_init_kni(struct app_params *app) {
+	if (app->n_pktq_kni == 0)
+		return;
+
+	rte_panic("Can not init KNI without librte_kni support.\n");
+}
+#else
+static void
+app_init_kni(struct app_params *app) {
+	uint32_t i;
+
+	if (app->n_pktq_kni == 0)
+		return;
+
+	rte_kni_init(app->n_pktq_kni);
+
+	for (i = 0; i < app->n_pktq_kni; i++) {
+		struct app_pktq_kni_params *p_kni = &app->kni_params[i];
+		struct app_link_params *p_link;
+		struct rte_eth_dev_info dev_info;
+		struct app_mempool_params *mempool_params;
+		struct rte_mempool *mempool;
+		struct rte_kni_conf conf;
+		struct rte_kni_ops ops;
+
+		/* LINK */
+		p_link = app_get_link_for_kni(app, p_kni);
+		memset(&dev_info, 0, sizeof(dev_info));
+		rte_eth_dev_info_get(p_link->pmd_id, &dev_info);
+
+		/* MEMPOOL */
+		mempool_params = &app->mempool_params[p_kni->mempool_id];
+		mempool = app->mempool[p_kni->mempool_id];
+
+		/* KNI */
+		memset(&conf, 0, sizeof(conf));
+		snprintf(conf.name, RTE_KNI_NAMESIZE, "%s", p_kni->name);
+		conf.force_bind = p_kni->force_bind;
+		if (conf.force_bind) {
+			int lcore_id;
+
+			lcore_id = cpu_core_map_get_lcore_id(app->core_map,
+				p_kni->socket_id,
+				p_kni->core_id,
+				p_kni->hyper_th_id);
+
+			if (lcore_id < 0)
+				rte_panic("%s invalid CPU core\n", p_kni->name);
+
+			conf.core_id = (uint32_t) lcore_id;
+		}
+		conf.group_id = p_link->pmd_id;
+		conf.mbuf_size = mempool_params->buffer_size;
+		conf.addr = dev_info.pci_dev->addr;
+		conf.id = dev_info.pci_dev->id;
+
+		memset(&ops, 0, sizeof(ops));
+		ops.port_id = (uint8_t) p_link->pmd_id;
+		ops.change_mtu = kni_change_mtu;
+		ops.config_network_if = kni_config_network_interface;
+
+		APP_LOG(app, HIGH, "Initializing %s ...", p_kni->name);
+		app->kni[i] = rte_kni_alloc(mempool, &conf, &ops);
+		if (!app->kni[i])
+			rte_panic("%s init error\n", p_kni->name);
+	}
+}
+#endif /* RTE_LIBRTE_KNI */
+
 static void
 app_init_msgq(struct app_params *app)
 {
@@ -1061,14 +1301,15 @@ app_init_msgq(struct app_params *app)
 	}
 }
 
-static void app_pipeline_params_get(struct app_params *app,
+void app_pipeline_params_get(struct app_params *app,
 	struct app_pipeline_params *p_in,
 	struct pipeline_params *p_out)
 {
 	uint32_t i;
-	uint32_t mempool_id;
 
 	snprintf(p_out->name, PIPELINE_NAME_SIZE, "%s", p_in->name);
+
+	snprintf(p_out->type, PIPELINE_TYPE_SIZE, "%s", p_in->type);
 
 	p_out->socket_id = (int) p_in->socket_id;
 
@@ -1145,16 +1386,35 @@ static void app_pipeline_params_get(struct app_params *app,
 			break;
 		}
 		case APP_PKTQ_IN_TM:
+		{
 			out->type = PIPELINE_PORT_IN_SCHED_READER;
 			out->params.sched.sched = app->tm[in->id];
 			out->burst_size = app->tm_params[in->id].burst_read;
 			break;
+		}
+#ifdef RTE_LIBRTE_KNI
+		case APP_PKTQ_IN_KNI:
+		{
+			out->type = PIPELINE_PORT_IN_KNI_READER;
+			out->params.kni.kni = app->kni[in->id];
+			out->burst_size = app->kni_params[in->id].burst_read;
+			break;
+		}
+#endif /* RTE_LIBRTE_KNI */
 		case APP_PKTQ_IN_SOURCE:
-			mempool_id = app->source_params[in->id].mempool_id;
+		{
+			uint32_t mempool_id =
+				app->source_params[in->id].mempool_id;
+
 			out->type = PIPELINE_PORT_IN_SOURCE;
 			out->params.source.mempool = app->mempool[mempool_id];
 			out->burst_size = app->source_params[in->id].burst;
+			out->params.source.file_name =
+				app->source_params[in->id].file_name;
+			out->params.source.n_bytes_per_pkt =
+				app->source_params[in->id].n_bytes_per_pkt;
 			break;
+		}
 		default:
 			break;
 		}
@@ -1265,7 +1525,8 @@ static void app_pipeline_params_get(struct app_params *app,
 			}
 			break;
 		}
-		case APP_PKTQ_OUT_TM: {
+		case APP_PKTQ_OUT_TM:
+		{
 			struct rte_port_sched_writer_params *params =
 				&out->params.sched;
 
@@ -1275,9 +1536,45 @@ static void app_pipeline_params_get(struct app_params *app,
 				app->tm_params[in->id].burst_write;
 			break;
 		}
-		case APP_PKTQ_OUT_SINK:
-			out->type = PIPELINE_PORT_OUT_SINK;
+#ifdef RTE_LIBRTE_KNI
+		case APP_PKTQ_OUT_KNI:
+		{
+			struct app_pktq_kni_params *p_kni =
+				&app->kni_params[in->id];
+
+			if (p_kni->dropless == 0) {
+				struct rte_port_kni_writer_params *params =
+					&out->params.kni;
+
+				out->type = PIPELINE_PORT_OUT_KNI_WRITER;
+				params->kni = app->kni[in->id];
+				params->tx_burst_sz =
+					app->kni_params[in->id].burst_write;
+			} else {
+				struct rte_port_kni_writer_nodrop_params
+					*params = &out->params.kni_nodrop;
+
+				out->type = PIPELINE_PORT_OUT_KNI_WRITER_NODROP;
+				params->kni = app->kni[in->id];
+				params->tx_burst_sz =
+					app->kni_params[in->id].burst_write;
+				params->n_retries =
+					app->kni_params[in->id].n_retries;
+			}
 			break;
+		}
+#endif /* RTE_LIBRTE_KNI */
+		case APP_PKTQ_OUT_SINK:
+		{
+			out->type = PIPELINE_PORT_OUT_SINK;
+			out->params.sink.file_name =
+				app->sink_params[in->id].file_name;
+			out->params.sink.max_n_pkts =
+				app->sink_params[in->id].
+				n_pkts_to_dump;
+
+			break;
+		}
 		default:
 			break;
 		}
@@ -1343,8 +1640,29 @@ app_init_pipelines(struct app_params *app)
 
 		data->ptype = ptype;
 
-		data->timer_period = (rte_get_tsc_hz() * params->timer_period)
-			/ 1000;
+		data->timer_period = (rte_get_tsc_hz() *
+			params->timer_period) / 100;
+	}
+}
+
+static void
+app_post_init_pipelines(struct app_params *app)
+{
+	uint32_t p_id;
+
+	for (p_id = 0; p_id < app->n_pipelines; p_id++) {
+		struct app_pipeline_params *params =
+			&app->pipeline_params[p_id];
+		struct app_pipeline_data *data = &app->pipeline_data[p_id];
+		int status;
+
+		if (data->ptype->fe_ops->f_post_init == NULL)
+			continue;
+
+		status = data->ptype->fe_ops->f_post_init(data->fe);
+		if (status)
+			rte_panic("Pipeline instance \"%s\" front-end "
+				"post-init error\n", params->name);
 	}
 }
 
@@ -1378,6 +1696,10 @@ app_init_threads(struct app_params *app)
 
 		t->timer_period = (rte_get_tsc_hz() * APP_THREAD_TIMER_PERIOD) / 1000;
 		t->thread_req_deadline = time + t->timer_period;
+
+		t->headroom_cycles = 0;
+		t->headroom_time = rte_get_tsc_cycles();
+		t->headroom_ratio = 0.0;
 
 		t->msgq_in = app_thread_msgq_in_get(app,
 				params->socket_id,
@@ -1430,6 +1752,7 @@ int app_init(struct app_params *app)
 	app_init_link(app);
 	app_init_swq(app);
 	app_init_tm(app);
+	app_init_kni(app);
 	app_init_msgq(app);
 
 	app_pipeline_common_cmd_push(app);
@@ -1443,6 +1766,13 @@ int app_init(struct app_params *app)
 
 	app_init_pipelines(app);
 	app_init_threads(app);
+
+	return 0;
+}
+
+int app_post_init(struct app_params *app)
+{
+	app_post_init_pipelines(app);
 
 	return 0;
 }

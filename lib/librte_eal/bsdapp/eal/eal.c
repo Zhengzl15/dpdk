@@ -1,7 +1,7 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright(c) 2010-2014 Intel Corporation. All rights reserved.
+ *   Copyright(c) 2010-2016 Intel Corporation. All rights reserved.
  *   Copyright(c) 2014 6WIND S.A.
  *   All rights reserved.
  *
@@ -569,8 +569,6 @@ rte_eal_init(int argc, char **argv)
 
 	eal_check_mem_on_local_socket();
 
-	rte_eal_mcfg_complete();
-
 	if (eal_plugins_init() < 0)
 		rte_panic("Cannot init plugins\n");
 
@@ -607,7 +605,7 @@ rte_eal_init(int argc, char **argv)
 		/* Set thread_name for aid in debugging. */
 		snprintf(thread_name, RTE_MAX_THREAD_NAME_LEN,
 				"lcore-slave-%d", i);
-		pthread_set_name_np(lcore_config[i].thread_id, thread_name);
+		rte_thread_setname(lcore_config[i].thread_id, thread_name);
 	}
 
 	/*
@@ -620,6 +618,8 @@ rte_eal_init(int argc, char **argv)
 	/* Probe & Initialize PCI devices */
 	if (rte_eal_pci_probe())
 		rte_panic("Cannot probe PCI\n");
+
+	rte_eal_mcfg_complete();
 
 	return fctret;
 }

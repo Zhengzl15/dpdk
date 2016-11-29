@@ -28,14 +28,17 @@
     (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
     OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-DPDK Release Notes
-==================
+Release Notes
+=============
 
 .. toctree::
     :maxdepth: 1
     :numbered:
 
     rel_description
+    release_16_11
+    release_16_07
+    release_16_04
     release_2_2
     release_2_1
     release_2_0

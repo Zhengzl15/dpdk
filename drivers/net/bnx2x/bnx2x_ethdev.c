@@ -16,16 +16,65 @@
 /*
  * The set of PCI devices this driver supports
  */
+#define BROADCOM_PCI_VENDOR_ID 0x14E4
 static struct rte_pci_id pci_id_bnx2x_map[] = {
-#define RTE_PCI_DEV_ID_DECL_BNX2X(vend, dev) {RTE_PCI_DEVICE(vend, dev)},
-#include "rte_pci_dev_ids.h"
+	{ RTE_PCI_DEVICE(BROADCOM_PCI_VENDOR_ID, CHIP_NUM_57800) },
+	{ RTE_PCI_DEVICE(BROADCOM_PCI_VENDOR_ID, CHIP_NUM_57711) },
+	{ RTE_PCI_DEVICE(BROADCOM_PCI_VENDOR_ID, CHIP_NUM_57810) },
+	{ RTE_PCI_DEVICE(BROADCOM_PCI_VENDOR_ID, CHIP_NUM_57811) },
+	{ RTE_PCI_DEVICE(BROADCOM_PCI_VENDOR_ID, CHIP_NUM_57840_OBS) },
+	{ RTE_PCI_DEVICE(BROADCOM_PCI_VENDOR_ID, CHIP_NUM_57840_4_10) },
+	{ RTE_PCI_DEVICE(BROADCOM_PCI_VENDOR_ID, CHIP_NUM_57840_2_20) },
+#ifdef RTE_LIBRTE_BNX2X_MF_SUPPORT
+	{ RTE_PCI_DEVICE(BROADCOM_PCI_VENDOR_ID, CHIP_NUM_57810_MF) },
+	{ RTE_PCI_DEVICE(BROADCOM_PCI_VENDOR_ID, CHIP_NUM_57811_MF) },
+	{ RTE_PCI_DEVICE(BROADCOM_PCI_VENDOR_ID, CHIP_NUM_57840_MF) },
+#endif
 	{ .vendor_id = 0, }
 };
 
 static struct rte_pci_id pci_id_bnx2xvf_map[] = {
-#define RTE_PCI_DEV_ID_DECL_BNX2XVF(vend, dev) {RTE_PCI_DEVICE(vend, dev)},
-#include "rte_pci_dev_ids.h"
+	{ RTE_PCI_DEVICE(BROADCOM_PCI_VENDOR_ID, CHIP_NUM_57800_VF) },
+	{ RTE_PCI_DEVICE(BROADCOM_PCI_VENDOR_ID, CHIP_NUM_57810_VF) },
+	{ RTE_PCI_DEVICE(BROADCOM_PCI_VENDOR_ID, CHIP_NUM_57811_VF) },
+	{ RTE_PCI_DEVICE(BROADCOM_PCI_VENDOR_ID, CHIP_NUM_57840_VF) },
 	{ .vendor_id = 0, }
+};
+
+struct rte_bnx2x_xstats_name_off {
+	char name[RTE_ETH_XSTATS_NAME_SIZE];
+	uint32_t offset_hi;
+	uint32_t offset_lo;
+};
+
+static const struct rte_bnx2x_xstats_name_off bnx2x_xstats_strings[] = {
+	{"rx_buffer_drops",
+		offsetof(struct bnx2x_eth_stats, brb_drop_hi),
+		offsetof(struct bnx2x_eth_stats, brb_drop_lo)},
+	{"rx_buffer_truncates",
+		offsetof(struct bnx2x_eth_stats, brb_truncate_hi),
+		offsetof(struct bnx2x_eth_stats, brb_truncate_lo)},
+	{"rx_buffer_truncate_discard",
+		offsetof(struct bnx2x_eth_stats, brb_truncate_discard),
+		offsetof(struct bnx2x_eth_stats, brb_truncate_discard)},
+	{"mac_filter_discard",
+		offsetof(struct bnx2x_eth_stats, mac_filter_discard),
+		offsetof(struct bnx2x_eth_stats, mac_filter_discard)},
+	{"no_match_vlan_tag_discard",
+		offsetof(struct bnx2x_eth_stats, mf_tag_discard),
+		offsetof(struct bnx2x_eth_stats, mf_tag_discard)},
+	{"tx_pause",
+		offsetof(struct bnx2x_eth_stats, pause_frames_sent_hi),
+		offsetof(struct bnx2x_eth_stats, pause_frames_sent_lo)},
+	{"rx_pause",
+		offsetof(struct bnx2x_eth_stats, pause_frames_received_hi),
+		offsetof(struct bnx2x_eth_stats, pause_frames_received_lo)},
+	{"tx_priority_flow_control",
+		offsetof(struct bnx2x_eth_stats, pfc_frames_sent_hi),
+		offsetof(struct bnx2x_eth_stats, pfc_frames_sent_lo)},
+	{"rx_priority_flow_control",
+		offsetof(struct bnx2x_eth_stats, pfc_frames_received_hi),
+		offsetof(struct bnx2x_eth_stats, pfc_frames_received_lo)}
 };
 
 static void
@@ -44,9 +93,9 @@ bnx2x_link_update(struct rte_eth_dev *dev)
 		case DUPLEX_HALF:
 			dev->data->dev_link.link_duplex = ETH_LINK_HALF_DUPLEX;
 			break;
-		default:
-			dev->data->dev_link.link_duplex = ETH_LINK_AUTONEG_DUPLEX;
 	}
+	dev->data->dev_link.link_autoneg = !(dev->data->dev_conf.link_speeds &
+			ETH_LINK_SPEED_FIXED);
 	dev->data->dev_link.link_status = sc->link_vars.link_up;
 }
 
@@ -58,8 +107,8 @@ bnx2x_interrupt_action(struct rte_eth_dev *dev)
 
 	PMD_DEBUG_PERIODIC_LOG(INFO, "Interrupt handled");
 
-	if (bnx2x_intr_legacy(sc, 0))
-		DELAY_MS(250);
+	bnx2x_intr_legacy(sc, 0);
+
 	if (sc->periodic_flags & PERIODIC_GO)
 		bnx2x_periodic_callout(sc);
 	link_status = REG_RD(sc, sc->link_params.shmem_base +
@@ -87,7 +136,6 @@ bnx2x_dev_configure(struct rte_eth_dev *dev)
 {
 	struct bnx2x_softc *sc = dev->data->dev_private;
 	int mp_ncpus = sysconf(_SC_NPROCESSORS_CONF);
-	int ret;
 
 	PMD_INIT_FUNC_TRACE();
 
@@ -119,25 +167,6 @@ bnx2x_dev_configure(struct rte_eth_dev *dev)
 		PMD_DRV_LOG(ERR, "bnx2x_alloc_hsi_mem was failed");
 		bnx2x_free_ilt_mem(sc);
 		return -ENXIO;
-	}
-
-	if (IS_VF(sc)) {
-		if (bnx2x_dma_alloc(sc, sizeof(struct bnx2x_vf_mbx_msg),
-				  &sc->vf2pf_mbox_mapping, "vf2pf_mbox",
-				  RTE_CACHE_LINE_SIZE) != 0)
-			return -ENOMEM;
-
-		sc->vf2pf_mbox = (struct bnx2x_vf_mbx_msg *)sc->vf2pf_mbox_mapping.vaddr;
-		if (bnx2x_dma_alloc(sc, sizeof(struct bnx2x_vf_bulletin),
-				  &sc->pf2vf_bulletin_mapping, "vf2pf_bull",
-				  RTE_CACHE_LINE_SIZE) != 0)
-			return -ENOMEM;
-
-		sc->pf2vf_bulletin = (struct bnx2x_vf_bulletin *)sc->pf2vf_bulletin_mapping.vaddr;
-
-		ret = bnx2x_vf_get_resources(sc, sc->num_queues, sc->num_queues);
-		if (ret)
-			return ret;
 	}
 
 	return 0;
@@ -286,7 +315,7 @@ bnx2xvf_dev_link_update(struct rte_eth_dev *dev, __rte_unused int wait_to_comple
 	if (sc->old_bulletin.valid_bitmap & (1 << CHANNEL_DOWN)) {
 		PMD_DRV_LOG(ERR, "PF indicated channel is down."
 				"VF device is no longer operational");
-		dev->data->dev_link.link_status = 0;
+		dev->data->dev_link.link_status = ETH_LINK_DOWN;
 	}
 
 	return old_link_status == dev->data->dev_link.link_status ? -1 : 0;
@@ -296,6 +325,9 @@ static void
 bnx2x_dev_stats_get(struct rte_eth_dev *dev, struct rte_eth_stats *stats)
 {
 	struct bnx2x_softc *sc = dev->data->dev_private;
+	uint32_t brb_truncate_discard;
+	uint64_t brb_drops;
+	uint64_t brb_truncates;
 
 	PMD_INIT_FUNC_TRACE();
 
@@ -336,6 +368,65 @@ bnx2x_dev_stats_get(struct rte_eth_dev *dev, struct rte_eth_stats *stats)
 	stats->rx_nombuf =
 		HILO_U64(sc->eth_stats.no_buff_discard_hi,
 				sc->eth_stats.no_buff_discard_lo);
+
+	brb_drops =
+		HILO_U64(sc->eth_stats.brb_drop_hi,
+			 sc->eth_stats.brb_drop_lo);
+
+	brb_truncates =
+		HILO_U64(sc->eth_stats.brb_truncate_hi,
+			 sc->eth_stats.brb_truncate_lo);
+
+	brb_truncate_discard = sc->eth_stats.brb_truncate_discard;
+
+	stats->imissed = brb_drops + brb_truncates +
+			 brb_truncate_discard + stats->rx_nombuf;
+}
+
+static int
+bnx2x_get_xstats_names(__rte_unused struct rte_eth_dev *dev,
+		       struct rte_eth_xstat_name *xstats_names,
+		       __rte_unused unsigned limit)
+{
+	unsigned int i, stat_cnt = RTE_DIM(bnx2x_xstats_strings);
+
+	if (xstats_names != NULL)
+		for (i = 0; i < stat_cnt; i++)
+			snprintf(xstats_names[i].name,
+				sizeof(xstats_names[i].name),
+				"%s",
+				bnx2x_xstats_strings[i].name);
+
+	return stat_cnt;
+}
+
+static int
+bnx2x_dev_xstats_get(struct rte_eth_dev *dev, struct rte_eth_xstat *xstats,
+		     unsigned int n)
+{
+	struct bnx2x_softc *sc = dev->data->dev_private;
+	unsigned int num = RTE_DIM(bnx2x_xstats_strings);
+
+	if (n < num)
+		return num;
+
+	bnx2x_stats_handle(sc, STATS_EVENT_UPDATE);
+
+	for (num = 0; num < n; num++) {
+		if (bnx2x_xstats_strings[num].offset_hi !=
+		    bnx2x_xstats_strings[num].offset_lo)
+			xstats[num].value = HILO_U64(
+					  *(uint32_t *)((char *)&sc->eth_stats +
+					  bnx2x_xstats_strings[num].offset_hi),
+					  *(uint32_t *)((char *)&sc->eth_stats +
+					  bnx2x_xstats_strings[num].offset_lo));
+		else
+			xstats[num].value =
+					  *(uint64_t *)((char *)&sc->eth_stats +
+					  bnx2x_xstats_strings[num].offset_lo);
+	}
+
+	return num;
 }
 
 static void
@@ -347,6 +438,7 @@ bnx2x_dev_infos_get(struct rte_eth_dev *dev, __rte_unused struct rte_eth_dev_inf
 	dev_info->min_rx_bufsize = BNX2X_MIN_RX_BUF_SIZE;
 	dev_info->max_rx_pktlen  = BNX2X_MAX_RX_PKT_LEN;
 	dev_info->max_mac_addrs  = BNX2X_MAX_MAC_ADDRS;
+	dev_info->speed_capa = ETH_LINK_SPEED_10G | ETH_LINK_SPEED_20G;
 }
 
 static void
@@ -368,7 +460,7 @@ bnx2x_mac_addr_remove(struct rte_eth_dev *dev, uint32_t index)
 		sc->mac_ops.mac_addr_remove(dev, index);
 }
 
-static struct eth_dev_ops bnx2x_eth_dev_ops = {
+static const struct eth_dev_ops bnx2x_eth_dev_ops = {
 	.dev_configure                = bnx2x_dev_configure,
 	.dev_start                    = bnx2x_dev_start,
 	.dev_stop                     = bnx2x_dev_stop,
@@ -379,6 +471,8 @@ static struct eth_dev_ops bnx2x_eth_dev_ops = {
 	.allmulticast_disable         = bnx2x_dev_allmulticast_disable,
 	.link_update                  = bnx2x_dev_link_update,
 	.stats_get                    = bnx2x_dev_stats_get,
+	.xstats_get                   = bnx2x_dev_xstats_get,
+	.xstats_get_names             = bnx2x_get_xstats_names,
 	.dev_infos_get                = bnx2x_dev_infos_get,
 	.rx_queue_setup               = bnx2x_dev_rx_queue_setup,
 	.rx_queue_release             = bnx2x_dev_rx_queue_release,
@@ -391,7 +485,7 @@ static struct eth_dev_ops bnx2x_eth_dev_ops = {
 /*
  * dev_ops for virtual function
  */
-static struct eth_dev_ops bnx2xvf_eth_dev_ops = {
+static const struct eth_dev_ops bnx2xvf_eth_dev_ops = {
 	.dev_configure                = bnx2x_dev_configure,
 	.dev_start                    = bnx2x_dev_start,
 	.dev_stop                     = bnx2x_dev_stop,
@@ -402,6 +496,8 @@ static struct eth_dev_ops bnx2xvf_eth_dev_ops = {
 	.allmulticast_disable         = bnx2x_dev_allmulticast_disable,
 	.link_update                  = bnx2xvf_dev_link_update,
 	.stats_get                    = bnx2x_dev_stats_get,
+	.xstats_get                   = bnx2x_dev_xstats_get,
+	.xstats_get_names             = bnx2x_get_xstats_names,
 	.dev_infos_get                = bnx2x_dev_infos_get,
 	.rx_queue_setup               = bnx2x_dev_rx_queue_setup,
 	.rx_queue_release             = bnx2x_dev_rx_queue_release,
@@ -466,6 +562,7 @@ bnx2x_common_dev_init(struct rte_eth_dev *eth_dev, int is_vf)
 	ret = bnx2x_attach(sc);
 	if (ret) {
 		PMD_DRV_LOG(ERR, "bnx2x_attach failed (%d)", ret);
+		return ret;
 	}
 
 	eth_dev->data->mac_addrs = (struct ether_addr *)sc->link_params.mac_addr;
@@ -479,7 +576,30 @@ bnx2x_common_dev_init(struct rte_eth_dev *eth_dev, int is_vf)
 	PMD_DRV_LOG(INFO, "portID=%d vendorID=0x%x deviceID=0x%x",
 			eth_dev->data->port_id, pci_dev->id.vendor_id, pci_dev->id.device_id);
 
-	return ret;
+	if (IS_VF(sc)) {
+		if (bnx2x_dma_alloc(sc, sizeof(struct bnx2x_vf_mbx_msg),
+				    &sc->vf2pf_mbox_mapping, "vf2pf_mbox",
+				    RTE_CACHE_LINE_SIZE) != 0)
+			return -ENOMEM;
+
+		sc->vf2pf_mbox = (struct bnx2x_vf_mbx_msg *)
+					 sc->vf2pf_mbox_mapping.vaddr;
+
+		if (bnx2x_dma_alloc(sc, sizeof(struct bnx2x_vf_bulletin),
+				    &sc->pf2vf_bulletin_mapping, "vf2pf_bull",
+				    RTE_CACHE_LINE_SIZE) != 0)
+			return -ENOMEM;
+
+		sc->pf2vf_bulletin = (struct bnx2x_vf_bulletin *)
+					     sc->pf2vf_bulletin_mapping.vaddr;
+
+		ret = bnx2x_vf_get_resources(sc, sc->max_tx_queues,
+					     sc->max_rx_queues);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 
 static int
@@ -545,5 +665,7 @@ static struct rte_driver rte_bnx2xvf_driver = {
 	.init = rte_bnx2xvf_pmd_init,
 };
 
-PMD_REGISTER_DRIVER(rte_bnx2x_driver);
-PMD_REGISTER_DRIVER(rte_bnx2xvf_driver);
+PMD_REGISTER_DRIVER(rte_bnx2x_driver, bnx2x);
+DRIVER_REGISTER_PCI_TABLE(bnx2x, pci_id_bnx2x_map);
+PMD_REGISTER_DRIVER(rte_bnx2xvf_driver, bnx2xvf);
+DRIVER_REGISTER_PCI_TABLE(bnx2xvf, pci_id_bnx2xvf_map);

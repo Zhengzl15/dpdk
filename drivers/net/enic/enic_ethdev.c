@@ -57,15 +57,11 @@
 /*
  * The set of PCI devices this driver supports
  */
+#define CISCO_PCI_VENDOR_ID 0x1137
 static const struct rte_pci_id pci_id_enic_map[] = {
-#define RTE_PCI_DEV_ID_DECL_ENIC(vend, dev) {RTE_PCI_DEVICE(vend, dev)},
-#ifndef PCI_VENDOR_ID_CISCO
-#define PCI_VENDOR_ID_CISCO	0x1137
-#endif
-#include "rte_pci_dev_ids.h"
-RTE_PCI_DEV_ID_DECL_ENIC(PCI_VENDOR_ID_CISCO, PCI_DEVICE_ID_CISCO_VIC_ENET)
-RTE_PCI_DEV_ID_DECL_ENIC(PCI_VENDOR_ID_CISCO, PCI_DEVICE_ID_CISCO_VIC_ENET_VF)
-{.vendor_id = 0, /* Sentinal */},
+	{ RTE_PCI_DEVICE(CISCO_PCI_VENDOR_ID, PCI_DEVICE_ID_CISCO_VIC_ENET) },
+	{ RTE_PCI_DEVICE(CISCO_PCI_VENDOR_ID, PCI_DEVICE_ID_CISCO_VIC_ENET_VF) },
+	{.vendor_id = 0, /* sentinel */},
 };
 
 static int
@@ -146,8 +142,20 @@ static int enicpmd_dev_setup_intr(struct enic *enic)
 		if (!enic->cq[index].ctrl)
 			break;
 	}
-
 	if (enic->cq_count != index)
+		return 0;
+	for (index = 0; index < enic->wq_count; index++) {
+		if (!enic->wq[index].ctrl)
+			break;
+	}
+	if (enic->wq_count != index)
+		return 0;
+	/* check start of packet (SOP) RQs only in case scatter is disabled. */
+	for (index = 0; index < enic->rq_count; index++) {
+		if (!enic->rq[enic_sop_rq(index)].ctrl)
+			break;
+	}
+	if (enic->rq_count != index)
 		return 0;
 
 	ret = enic_alloc_intr_resources(enic);
@@ -174,6 +182,13 @@ static int enicpmd_dev_tx_queue_setup(struct rte_eth_dev *eth_dev,
 	struct enic *enic = pmd_priv(eth_dev);
 
 	ENICPMD_FUNC_TRACE();
+	if (queue_idx >= ENIC_WQ_MAX) {
+		dev_err(enic,
+			"Max number of TX queues exceeded.  Max is %d\n",
+			ENIC_WQ_MAX);
+		return -EINVAL;
+	}
+
 	eth_dev->data->tx_queues[queue_idx] = (void *)&enic->wq[queue_idx];
 
 	ret = enic_alloc_wq(enic, queue_idx, socket_id, nb_desc);
@@ -193,7 +208,6 @@ static int enicpmd_dev_tx_queue_start(struct rte_eth_dev *eth_dev,
 	ENICPMD_FUNC_TRACE();
 
 	enic_start_wq(enic, queue_idx);
-	eth_dev->data->tx_queue_state[queue_idx] = RTE_ETH_QUEUE_STATE_STARTED;
 
 	return 0;
 }
@@ -209,8 +223,6 @@ static int enicpmd_dev_tx_queue_stop(struct rte_eth_dev *eth_dev,
 	ret = enic_stop_wq(enic, queue_idx);
 	if (ret)
 		dev_err(enic, "error in stopping wq %d\n", queue_idx);
-	else
-		eth_dev->data->tx_queue_state[queue_idx] = RTE_ETH_QUEUE_STATE_STOPPED;
 
 	return ret;
 }
@@ -223,7 +235,6 @@ static int enicpmd_dev_rx_queue_start(struct rte_eth_dev *eth_dev,
 	ENICPMD_FUNC_TRACE();
 
 	enic_start_rq(enic, queue_idx);
-	eth_dev->data->rx_queue_state[queue_idx] = RTE_ETH_QUEUE_STATE_STARTED;
 
 	return 0;
 }
@@ -239,8 +250,6 @@ static int enicpmd_dev_rx_queue_stop(struct rte_eth_dev *eth_dev,
 	ret = enic_stop_rq(enic, queue_idx);
 	if (ret)
 		dev_err(enic, "error in stopping rq %d\n", queue_idx);
-	else
-		eth_dev->data->rx_queue_state[queue_idx] = RTE_ETH_QUEUE_STATE_STOPPED;
 
 	return ret;
 }
@@ -255,20 +264,35 @@ static int enicpmd_dev_rx_queue_setup(struct rte_eth_dev *eth_dev,
 	uint16_t queue_idx,
 	uint16_t nb_desc,
 	unsigned int socket_id,
-	__rte_unused const struct rte_eth_rxconf *rx_conf,
+	const struct rte_eth_rxconf *rx_conf,
 	struct rte_mempool *mp)
 {
 	int ret;
 	struct enic *enic = pmd_priv(eth_dev);
 
 	ENICPMD_FUNC_TRACE();
-	eth_dev->data->rx_queues[queue_idx] = (void *)&enic->rq[queue_idx];
+	/* With Rx scatter support, two RQs are now used on VIC per RQ used
+	 * by the application.
+	 */
+	if (queue_idx * 2 >= ENIC_RQ_MAX) {
+		dev_err(enic,
+			"Max number of RX queues exceeded.  Max is %d. This PMD uses 2 RQs on VIC per RQ used by DPDK.\n",
+			ENIC_RQ_MAX);
+		return -EINVAL;
+	}
+
+	eth_dev->data->rx_queues[queue_idx] =
+		(void *)&enic->rq[enic_sop_rq(queue_idx)];
 
 	ret = enic_alloc_rq(enic, queue_idx, socket_id, mp, nb_desc);
 	if (ret) {
 		dev_err(enic, "error in allocating rq\n");
 		return ret;
 	}
+
+	enic->rq[queue_idx].rx_free_thresh = rx_conf->rx_free_thresh;
+	dev_debug(enic, "Set queue_id:%u free thresh:%u\n", queue_idx,
+			enic->rq[queue_idx].rx_free_thresh);
 
 	return enicpmd_dev_setup_intr(enic);
 }
@@ -332,6 +356,7 @@ static int enicpmd_dev_configure(struct rte_eth_dev *eth_dev)
 			eth_dev->data->dev_conf.rxmode.split_hdr_size);
 	}
 
+	enicpmd_vlan_offload_set(eth_dev, ETH_VLAN_STRIP_MASK);
 	enic->hw_ip_checksum = eth_dev->data->dev_conf.rxmode.hw_ip_checksum;
 	return 0;
 }
@@ -414,10 +439,12 @@ static void enicpmd_dev_info_get(struct rte_eth_dev *eth_dev,
 	struct enic *enic = pmd_priv(eth_dev);
 
 	ENICPMD_FUNC_TRACE();
-	device_info->max_rx_queues = enic->rq_count;
-	device_info->max_tx_queues = enic->wq_count;
+	/* Scattered Rx uses two receive queues per rx queue exposed to dpdk */
+	device_info->max_rx_queues = enic->conf_rq_count / 2;
+	device_info->max_tx_queues = enic->conf_wq_count;
 	device_info->min_rx_bufsize = ENIC_MIN_MTU;
-	device_info->max_rx_pktlen = enic->config.mtu;
+	device_info->max_rx_pktlen = enic->rte_dev->data->mtu
+				   + ETHER_HDR_LEN + 4;
 	device_info->max_mac_addrs = 1;
 	device_info->rx_offload_capa =
 		DEV_RX_OFFLOAD_VLAN_STRIP |
@@ -429,6 +456,26 @@ static void enicpmd_dev_info_get(struct rte_eth_dev *eth_dev,
 		DEV_TX_OFFLOAD_IPV4_CKSUM  |
 		DEV_TX_OFFLOAD_UDP_CKSUM   |
 		DEV_TX_OFFLOAD_TCP_CKSUM;
+	device_info->default_rxconf = (struct rte_eth_rxconf) {
+		.rx_free_thresh = ENIC_DEFAULT_RX_FREE_THRESH
+	};
+}
+
+static const uint32_t *enicpmd_dev_supported_ptypes_get(struct rte_eth_dev *dev)
+{
+	static const uint32_t ptypes[] = {
+		RTE_PTYPE_L3_IPV4_EXT_UNKNOWN,
+		RTE_PTYPE_L3_IPV6_EXT_UNKNOWN,
+		RTE_PTYPE_L4_TCP,
+		RTE_PTYPE_L4_UDP,
+		RTE_PTYPE_L4_FRAG,
+		RTE_PTYPE_L4_NONFRAG,
+		RTE_PTYPE_UNKNOWN
+	};
+
+	if (dev->rx_pkt_burst == enic_recv_pkts)
+		return ptypes;
+	return NULL;
 }
 
 static void enicpmd_dev_promiscuous_enable(struct rte_eth_dev *eth_dev)
@@ -485,69 +532,12 @@ static void enicpmd_remove_mac_addr(struct rte_eth_dev *eth_dev, __rte_unused ui
 	enic_del_mac_address(enic);
 }
 
-
-static uint16_t enicpmd_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
-	uint16_t nb_pkts)
+static int enicpmd_mtu_set(struct rte_eth_dev *eth_dev, uint16_t mtu)
 {
-	unsigned int index;
-	unsigned int frags;
-	unsigned int pkt_len;
-	unsigned int seg_len;
-	unsigned int inc_len;
-	unsigned int nb_segs;
-	struct rte_mbuf *tx_pkt, *next_tx_pkt;
-	struct vnic_wq *wq = (struct vnic_wq *)tx_queue;
-	struct enic *enic = vnic_dev_priv(wq->vdev);
-	unsigned short vlan_id;
-	unsigned short ol_flags;
-	uint8_t last_seg, eop;
+	struct enic *enic = pmd_priv(eth_dev);
 
-	for (index = 0; index < nb_pkts; index++) {
-		tx_pkt = *tx_pkts++;
-		inc_len = 0;
-		nb_segs = tx_pkt->nb_segs;
-		if (nb_segs > vnic_wq_desc_avail(wq)) {
-			if (index > 0)
-				enic_post_wq_index(wq);
-
-			/* wq cleanup and try again */
-			if (!enic_cleanup_wq(enic, wq) ||
-				(nb_segs > vnic_wq_desc_avail(wq))) {
-				return index;
-			}
-		}
-		pkt_len = tx_pkt->pkt_len;
-		vlan_id = tx_pkt->vlan_tci;
-		ol_flags = tx_pkt->ol_flags;
-		for (frags = 0; inc_len < pkt_len; frags++) {
-			if (!tx_pkt)
-				break;
-			next_tx_pkt = tx_pkt->next;
-			seg_len = tx_pkt->data_len;
-			inc_len += seg_len;
-			eop = (pkt_len == inc_len) || (!next_tx_pkt);
-			last_seg = eop &&
-				(index == ((unsigned int)nb_pkts - 1));
-			enic_send_pkt(enic, wq, tx_pkt, (unsigned short)seg_len,
-				      !frags, eop, last_seg, ol_flags, vlan_id);
-			tx_pkt = next_tx_pkt;
-		}
-	}
-
-	enic_cleanup_wq(enic, wq);
-	return index;
-}
-
-static uint16_t enicpmd_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
-	uint16_t nb_pkts)
-{
-	struct vnic_rq *rq = (struct vnic_rq *)rx_queue;
-	unsigned int work_done;
-
-	if (enic_poll(rq, rx_pkts, (unsigned int)nb_pkts, &work_done))
-		dev_err(enic, "error in enicpmd poll\n");
-
-	return work_done;
+	ENICPMD_FUNC_TRACE();
+	return enic_set_mtu(enic, mtu);
 }
 
 static const struct eth_dev_ops enicpmd_eth_dev_ops = {
@@ -566,7 +556,8 @@ static const struct eth_dev_ops enicpmd_eth_dev_ops = {
 	.stats_reset          = enicpmd_dev_stats_reset,
 	.queue_stats_mapping_set = NULL,
 	.dev_infos_get        = enicpmd_dev_info_get,
-	.mtu_set              = NULL,
+	.dev_supported_ptypes_get = enicpmd_dev_supported_ptypes_get,
+	.mtu_set              = enicpmd_mtu_set,
 	.vlan_filter_set      = enicpmd_vlan_filter_set,
 	.vlan_tpid_set        = NULL,
 	.vlan_offload_set     = enicpmd_vlan_offload_set,
@@ -606,8 +597,8 @@ static int eth_enicpmd_dev_init(struct rte_eth_dev *eth_dev)
 	enic->port_id = eth_dev->data->port_id;
 	enic->rte_dev = eth_dev;
 	eth_dev->dev_ops = &enicpmd_eth_dev_ops;
-	eth_dev->rx_pkt_burst = &enicpmd_recv_pkts;
-	eth_dev->tx_pkt_burst = &enicpmd_xmit_pkts;
+	eth_dev->rx_pkt_burst = &enic_recv_pkts;
+	eth_dev->tx_pkt_burst = &enic_xmit_pkts;
 
 	pdev = eth_dev->pci_dev;
 	rte_eth_copy_pci_info(eth_dev, pdev);
@@ -635,8 +626,8 @@ static struct eth_driver rte_enic_pmd = {
  * Register as the [Poll Mode] Driver of Cisco ENIC device.
  */
 static int
-rte_enic_pmd_init(const char *name __rte_unused,
-	const char *params __rte_unused)
+rte_enic_pmd_init(__rte_unused const char *name,
+	 __rte_unused const char *params)
 {
 	ENICPMD_FUNC_TRACE();
 
@@ -649,4 +640,5 @@ static struct rte_driver rte_enic_driver = {
 	.init = rte_enic_pmd_init,
 };
 
-PMD_REGISTER_DRIVER(rte_enic_driver);
+PMD_REGISTER_DRIVER(rte_enic_driver, enic);
+DRIVER_REGISTER_PCI_TABLE(enic, pci_id_enic_map);

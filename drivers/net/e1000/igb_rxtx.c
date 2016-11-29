@@ -79,22 +79,6 @@
 		PKT_TX_L4_MASK |		 \
 		PKT_TX_TCP_SEG)
 
-static inline struct rte_mbuf *
-rte_rxmbuf_alloc(struct rte_mempool *mp)
-{
-	struct rte_mbuf *m;
-
-	m = __rte_mbuf_raw_alloc(mp);
-	__rte_mbuf_sanity_check_raw(m, 0);
-	return (m);
-}
-
-#define RTE_MBUF_DATA_DMA_ADDR(mb) \
-	(uint64_t) ((mb)->buf_physaddr + (mb)->data_off)
-
-#define RTE_MBUF_DATA_DMA_ADDR_DEFAULT(mb) \
-	(uint64_t) ((mb)->buf_physaddr + RTE_PKTMBUF_HEADROOM)
-
 /**
  * Structure associated with each descriptor of the RX ring of a RX queue.
  */
@@ -331,9 +315,9 @@ igbe_set_xmit_ctx(struct igb_tx_queue* txq,
 	}
 
 	txq->ctx_cache[ctx_curr].flags = ol_flags;
-	txq->ctx_cache[ctx_idx].tx_offload.data =
+	txq->ctx_cache[ctx_curr].tx_offload.data =
 		tx_offload_mask.data & tx_offload.data;
-	txq->ctx_cache[ctx_idx].tx_offload_mask = tx_offload_mask;
+	txq->ctx_cache[ctx_curr].tx_offload_mask = tx_offload_mask;
 
 	ctx_txd->type_tucmd_mlhl = rte_cpu_to_le_32(type_tucmd_mlhl);
 	vlan_macip_lens = (uint32_t)tx_offload.data;
@@ -366,7 +350,7 @@ what_advctx_update(struct igb_tx_queue *txq, uint64_t flags,
 	}
 
 	/* Mismatch, use the previous context */
-	return (IGB_CTX_NUM);
+	return IGB_CTX_NUM;
 }
 
 static inline uint32_t
@@ -456,7 +440,7 @@ eth_igb_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 			ctx = what_advctx_update(txq, tx_ol_req, tx_offload);
 			/* Only allocate context descriptor if required*/
 			new_ctx = (ctx == IGB_CTX_NUM);
-			ctx = txq->ctx_curr;
+			ctx = txq->ctx_curr + txq->ctx_start;
 			tx_last = (uint16_t) (tx_last + new_ctx);
 		}
 		if (tx_last >= txq->nb_tx_desc)
@@ -518,7 +502,7 @@ eth_igb_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 		 */
 		if (! (txr[tx_end].wb.status & E1000_TXD_STAT_DD)) {
 			if (nb_tx == 0)
-				return (0);
+				return 0;
 			goto end_of_tx;
 		}
 
@@ -596,7 +580,7 @@ eth_igb_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 			 * Set up transmit descriptor.
 			 */
 			slen = (uint16_t) m_seg->data_len;
-			buf_dma_addr = RTE_MBUF_DATA_DMA_ADDR(m_seg);
+			buf_dma_addr = rte_mbuf_data_dma_addr(m_seg);
 			txd->read.buffer_addr =
 				rte_cpu_to_le_64(buf_dma_addr);
 			txd->read.cmd_type_len =
@@ -628,7 +612,7 @@ eth_igb_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 		   (unsigned) tx_id, (unsigned) nb_tx);
 	txq->tx_tail = tx_id;
 
-	return (nb_tx);
+	return nb_tx;
 }
 
 /*********************************************************************
@@ -745,7 +729,8 @@ rx_desc_status_to_pkt_flags(uint32_t rx_status)
 	uint64_t pkt_flags;
 
 	/* Check if VLAN present */
-	pkt_flags = (rx_status & E1000_RXD_STAT_VP) ?  PKT_RX_VLAN_PKT : 0;
+	pkt_flags = ((rx_status & E1000_RXD_STAT_VP) ?
+		PKT_RX_VLAN_PKT | PKT_RX_VLAN_STRIPPED : 0);
 
 #if defined(RTE_LIBRTE_IEEE1588)
 	if (rx_status & E1000_RXD_STAT_TMST)
@@ -844,7 +829,7 @@ eth_igb_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 			   (unsigned) rx_id, (unsigned) staterr,
 			   (unsigned) rte_le_to_cpu_16(rxd.wb.upper.length));
 
-		nmb = rte_rxmbuf_alloc(rxq->mb_pool);
+		nmb = rte_mbuf_raw_alloc(rxq->mb_pool);
 		if (nmb == NULL) {
 			PMD_RX_LOG(DEBUG, "RX mbuf alloc failed port_id=%u "
 				   "queue_id=%u", (unsigned) rxq->port_id,
@@ -875,7 +860,7 @@ eth_igb_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		rxm = rxe->mbuf;
 		rxe->mbuf = nmb;
 		dma_addr =
-			rte_cpu_to_le_64(RTE_MBUF_DATA_DMA_ADDR_DEFAULT(nmb));
+			rte_cpu_to_le_64(rte_mbuf_data_dma_addr_default(nmb));
 		rxdp->read.hdr_addr = 0;
 		rxdp->read.pkt_addr = dma_addr;
 
@@ -944,7 +929,7 @@ eth_igb_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		nb_hold = 0;
 	}
 	rxq->nb_rx_hold = nb_hold;
-	return (nb_rx);
+	return nb_rx;
 }
 
 uint16_t
@@ -1027,7 +1012,7 @@ eth_igb_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 			   (unsigned) rx_id, (unsigned) staterr,
 			   (unsigned) rte_le_to_cpu_16(rxd.wb.upper.length));
 
-		nmb = rte_rxmbuf_alloc(rxq->mb_pool);
+		nmb = rte_mbuf_raw_alloc(rxq->mb_pool);
 		if (nmb == NULL) {
 			PMD_RX_LOG(DEBUG, "RX mbuf alloc failed port_id=%u "
 				   "queue_id=%u", (unsigned) rxq->port_id,
@@ -1061,7 +1046,7 @@ eth_igb_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		 */
 		rxm = rxe->mbuf;
 		rxe->mbuf = nmb;
-		dma = rte_cpu_to_le_64(RTE_MBUF_DATA_DMA_ADDR_DEFAULT(nmb));
+		dma = rte_cpu_to_le_64(rte_mbuf_data_dma_addr_default(nmb));
 		rxdp->read.pkt_addr = dma;
 		rxdp->read.hdr_addr = 0;
 
@@ -1199,7 +1184,7 @@ eth_igb_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		nb_hold = 0;
 	}
 	rxq->nb_rx_hold = nb_hold;
-	return (nb_rx);
+	return nb_rx;
 }
 
 /*
@@ -1315,13 +1300,13 @@ eth_igb_tx_queue_setup(struct rte_eth_dev *dev,
 	 * driver.
 	 */
 	if (tx_conf->tx_free_thresh != 0)
-		PMD_INIT_LOG(WARNING, "The tx_free_thresh parameter is not "
+		PMD_INIT_LOG(INFO, "The tx_free_thresh parameter is not "
 			     "used for the 1G driver.");
 	if (tx_conf->tx_rs_thresh != 0)
-		PMD_INIT_LOG(WARNING, "The tx_rs_thresh parameter is not "
+		PMD_INIT_LOG(INFO, "The tx_rs_thresh parameter is not "
 			     "used for the 1G driver.");
-	if (tx_conf->tx_thresh.wthresh == 0)
-		PMD_INIT_LOG(WARNING, "To improve 1G driver performance, "
+	if (tx_conf->tx_thresh.wthresh == 0 && hw->mac.type != e1000_82576)
+		PMD_INIT_LOG(INFO, "To improve 1G driver performance, "
 			     "consider setting the TX WTHRESH value to 4, 8, "
 			     "or 16.");
 
@@ -1335,7 +1320,7 @@ eth_igb_tx_queue_setup(struct rte_eth_dev *dev,
 	txq = rte_zmalloc("ethdev TX queue", sizeof(struct igb_tx_queue),
 							RTE_CACHE_LINE_SIZE);
 	if (txq == NULL)
-		return (-ENOMEM);
+		return -ENOMEM;
 
 	/*
 	 * Allocate TX ring hardware descriptors. A memzone large enough to
@@ -1347,7 +1332,7 @@ eth_igb_tx_queue_setup(struct rte_eth_dev *dev,
 				      E1000_ALIGN, socket_id);
 	if (tz == NULL) {
 		igb_tx_queue_release(txq);
-		return (-ENOMEM);
+		return -ENOMEM;
 	}
 
 	txq->nb_tx_desc = nb_desc;
@@ -1371,7 +1356,7 @@ eth_igb_tx_queue_setup(struct rte_eth_dev *dev,
 				   RTE_CACHE_LINE_SIZE);
 	if (txq->sw_ring == NULL) {
 		igb_tx_queue_release(txq);
-		return (-ENOMEM);
+		return -ENOMEM;
 	}
 	PMD_INIT_LOG(DEBUG, "sw_ring=%p hw_ring=%p dma_addr=0x%"PRIx64,
 		     txq->sw_ring, txq->tx_ring, txq->tx_ring_phys_addr);
@@ -1380,7 +1365,7 @@ eth_igb_tx_queue_setup(struct rte_eth_dev *dev,
 	dev->tx_pkt_burst = eth_igb_xmit_pkts;
 	dev->data->tx_queues[queue_idx] = txq;
 
-	return (0);
+	return 0;
 }
 
 static void
@@ -1453,7 +1438,7 @@ eth_igb_rx_queue_setup(struct rte_eth_dev *dev,
 	if (nb_desc % IGB_RXD_ALIGN != 0 ||
 			(nb_desc > E1000_MAX_RING_DESC) ||
 			(nb_desc < E1000_MIN_RING_DESC)) {
-		return (-EINVAL);
+		return -EINVAL;
 	}
 
 	/* Free memory prior to re-allocation if needed */
@@ -1466,13 +1451,14 @@ eth_igb_rx_queue_setup(struct rte_eth_dev *dev,
 	rxq = rte_zmalloc("ethdev RX queue", sizeof(struct igb_rx_queue),
 			  RTE_CACHE_LINE_SIZE);
 	if (rxq == NULL)
-		return (-ENOMEM);
+		return -ENOMEM;
 	rxq->mb_pool = mp;
 	rxq->nb_rx_desc = nb_desc;
 	rxq->pthresh = rx_conf->rx_thresh.pthresh;
 	rxq->hthresh = rx_conf->rx_thresh.hthresh;
 	rxq->wthresh = rx_conf->rx_thresh.wthresh;
-	if (rxq->wthresh > 0 && hw->mac.type == e1000_82576)
+	if (rxq->wthresh > 0 &&
+	    (hw->mac.type == e1000_82576 || hw->mac.type == e1000_vfadapt_i350))
 		rxq->wthresh = 1;
 	rxq->drop_en = rx_conf->rx_drop_en;
 	rxq->rx_free_thresh = rx_conf->rx_free_thresh;
@@ -1493,7 +1479,7 @@ eth_igb_rx_queue_setup(struct rte_eth_dev *dev,
 				      E1000_ALIGN, socket_id);
 	if (rz == NULL) {
 		igb_rx_queue_release(rxq);
-		return (-ENOMEM);
+		return -ENOMEM;
 	}
 	rxq->rdt_reg_addr = E1000_PCI_REG_ADDR(hw, E1000_RDT(rxq->reg_idx));
 	rxq->rdh_reg_addr = E1000_PCI_REG_ADDR(hw, E1000_RDH(rxq->reg_idx));
@@ -1506,7 +1492,7 @@ eth_igb_rx_queue_setup(struct rte_eth_dev *dev,
 				   RTE_CACHE_LINE_SIZE);
 	if (rxq->sw_ring == NULL) {
 		igb_rx_queue_release(rxq);
-		return (-ENOMEM);
+		return -ENOMEM;
 	}
 	PMD_INIT_LOG(DEBUG, "sw_ring=%p hw_ring=%p dma_addr=0x%"PRIx64,
 		     rxq->sw_ring, rxq->rx_ring, rxq->rx_ring_phys_addr);
@@ -1962,15 +1948,15 @@ igb_alloc_rx_queue_mbufs(struct igb_rx_queue *rxq)
 	/* Initialize software ring entries. */
 	for (i = 0; i < rxq->nb_rx_desc; i++) {
 		volatile union e1000_adv_rx_desc *rxd;
-		struct rte_mbuf *mbuf = rte_rxmbuf_alloc(rxq->mb_pool);
+		struct rte_mbuf *mbuf = rte_mbuf_raw_alloc(rxq->mb_pool);
 
 		if (mbuf == NULL) {
 			PMD_INIT_LOG(ERR, "RX mbuf alloc failed "
 				     "queue_id=%hu", rxq->queue_id);
-			return (-ENOMEM);
+			return -ENOMEM;
 		}
 		dma_addr =
-			rte_cpu_to_le_64(RTE_MBUF_DATA_DMA_ADDR_DEFAULT(mbuf));
+			rte_cpu_to_le_64(rte_mbuf_data_dma_addr_default(mbuf));
 		rxd = &rxq->rx_ring[i];
 		rxd->read.hdr_addr = 0;
 		rxd->read.pkt_addr = dma_addr;

@@ -471,9 +471,20 @@ add_memzone_to_metadata(const struct rte_memzone * mz,
 		struct ivshmem_config * config)
 {
 	struct rte_ivshmem_metadata_entry * entry;
-	unsigned i;
+	unsigned i, idx;
+	struct rte_mem_config *mcfg;
+
+	if (mz->len == 0) {
+		RTE_LOG(ERR, EAL, "Trying to add an empty memzone\n");
+		return -1;
+	}
 
 	rte_spinlock_lock(&config->sl);
+
+	mcfg = rte_eal_get_configuration()->mem_config;
+
+	/* it prevents the memzone being freed while we add it to the metadata */
+	rte_rwlock_write_lock(&mcfg->mlock);
 
 	/* find free slot in this config */
 	for (i = 0; i < RTE_DIM(config->metadata->entry); i++) {
@@ -504,13 +515,6 @@ add_memzone_to_metadata(const struct rte_memzone * mz,
 				config->metadata->name);
 		goto fail;
 	}
-#ifdef RTE_LIBRTE_IVSHMEM
-	struct rte_mem_config *mcfg;
-	unsigned int idx;
-
-	mcfg = rte_eal_get_configuration()->mem_config;
-
-	rte_rwlock_write_lock(&mcfg->mlock);
 
 	idx = ((uintptr_t)mz - (uintptr_t)mcfg->memzone);
 	idx = idx / sizeof(struct rte_memzone);
@@ -519,10 +523,10 @@ add_memzone_to_metadata(const struct rte_memzone * mz,
 	mcfg->memzone[idx].ioremap_addr = mz->phys_addr;
 
 	rte_rwlock_write_unlock(&mcfg->mlock);
-#endif
 	rte_spinlock_unlock(&config->sl);
 	return 0;
 fail:
+	rte_rwlock_write_unlock(&mcfg->mlock);
 	rte_spinlock_unlock(&config->sl);
 	return -1;
 }
@@ -544,26 +548,40 @@ add_ring_to_metadata(const struct rte_ring * r,
 }
 
 static int
-add_mempool_to_metadata(const struct rte_mempool * mp,
-		struct ivshmem_config * config)
+add_mempool_memzone_to_metadata(const void *addr,
+		struct ivshmem_config *config)
 {
-	struct rte_memzone * mz;
-	int ret;
+	struct rte_memzone *mz;
 
-	mz = get_memzone_by_addr(mp);
-	ret = 0;
+	mz = get_memzone_by_addr(addr);
 
 	if (!mz) {
 		RTE_LOG(ERR, EAL, "Cannot find memzone for mempool!\n");
 		return -1;
 	}
 
-	/* mempool consists of memzone and ring */
-	ret = add_memzone_to_metadata(mz, config);
+	return add_memzone_to_metadata(mz, config);
+}
+
+static int
+add_mempool_to_metadata(const struct rte_mempool *mp,
+		struct ivshmem_config *config)
+{
+	struct rte_mempool_memhdr *memhdr;
+	int ret;
+
+	ret = add_mempool_memzone_to_metadata(mp, config);
 	if (ret < 0)
 		return -1;
 
-	return add_ring_to_metadata(mp->ring, config);
+	STAILQ_FOREACH(memhdr, &mp->mem_list, next) {
+		ret = add_mempool_memzone_to_metadata(memhdr->addr, config);
+		if (ret < 0)
+			return -1;
+	}
+
+	/* mempool consists of memzone and ring */
+	return add_ring_to_metadata(mp->pool_data, config);
 }
 
 int

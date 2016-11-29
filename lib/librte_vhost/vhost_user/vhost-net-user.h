@@ -38,14 +38,10 @@
 #include <linux/vhost.h>
 
 #include "rte_virtio_net.h"
-#include "fd_man.h"
-
-struct vhost_server {
-	char *path; /**< The path the uds is bind to. */
-	int listenfd;     /**< The listener sockfd. */
-};
 
 /* refer to hw/virtio/vhost-user.c */
+
+#define VHOST_MEMORY_MAX_NREGIONS 8
 
 typedef enum VhostUserRequest {
 	VHOST_USER_NONE = 0,
@@ -67,6 +63,7 @@ typedef enum VhostUserRequest {
 	VHOST_USER_SET_PROTOCOL_FEATURES = 16,
 	VHOST_USER_GET_QUEUE_NUM = 17,
 	VHOST_USER_SET_VRING_ENABLE = 18,
+	VHOST_USER_SEND_RARP = 19,
 	VHOST_USER_MAX
 } VhostUserRequest;
 
@@ -83,6 +80,11 @@ typedef struct VhostUserMemory {
 	VhostUserMemoryRegion regions[VHOST_MEMORY_MAX_NREGIONS];
 } VhostUserMemory;
 
+typedef struct VhostUserLog {
+	uint64_t mmap_size;
+	uint64_t mmap_offset;
+} VhostUserLog;
+
 typedef struct VhostUserMsg {
 	VhostUserRequest request;
 
@@ -97,6 +99,7 @@ typedef struct VhostUserMsg {
 		struct vhost_vring_state state;
 		struct vhost_vring_addr addr;
 		VhostUserMemory memory;
+		VhostUserLog    log;
 	} payload;
 	int fds[VHOST_MEMORY_MAX_NREGIONS];
 } __attribute((packed)) VhostUserMsg;

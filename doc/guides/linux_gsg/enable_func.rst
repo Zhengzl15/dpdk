@@ -183,30 +183,8 @@ High Performance of Small Packets on 40G NIC
 As there might be firmware fixes for performance enhancement in latest version
 of firmware image, the firmware update might be needed for getting high performance.
 Check with the local Intel's Network Division application engineers for firmware updates.
-The base driver to support firmware version of FVL3E will be integrated in the next
-DPDK release, so currently the validated firmware version is 4.2.6.
-
-Enabling Extended Tag and Setting Max Read Request Size
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-PCI configurations of ``extended_tag`` and max _read_requ st_size have big impacts on performance of small packets on 40G NIC.
-Enabling extended_tag and setting ``max_read_request_size`` to small size such as 128 bytes provide great helps to high performance of small packets.
-
-*   These can be done in some BIOS implementations.
-
-*   For other BIOS implementations, PCI configurations can be changed by using command of ``setpci``, or special configurations in DPDK config file of ``common_linux``.
-
-    *   Bits 7:5 at address of 0xA8 of each PCI device is used for setting the max_read_request_size,
-        and bit 8 of 0xA8 of each PCI device is used for enabling/disabling the extended_tag.
-        lspci and setpci can be used to read the values of 0xA8 and then write it back after being changed.
-
-    *   In config file of common_linux, below three configurations can be changed for the same purpose.
-
-        ``CONFIG_RTE_PCI_CONFIG``
-
-        ``CONFIG_RTE_PCI_EXTENDED_TAG``
-
-        ``CONFIG_RTE_PCI_MAX_READ_REQUEST_SIZE``
+Users should consult the release notes specific to a DPDK release to identify
+the validated firmware version for a NIC using the i40e driver.
 
 Use 16 Bytes RX Descriptor Size
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -1,7 +1,7 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright 2015 Intel Shannon Ltd. All rights reserved.
+ *   Copyright(c) 2015-2016 Intel Corporation. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -38,6 +38,42 @@
 #include <rte_log.h>
 #include <rte_keepalive.h>
 #include <rte_malloc.h>
+#include <rte_cycles.h>
+
+struct rte_keepalive {
+	/** Core Liveness. */
+	enum rte_keepalive_state __rte_cache_aligned state_flags[
+		RTE_KEEPALIVE_MAXCORES];
+
+	/** Last-seen-alive timestamps */
+	uint64_t last_alive[RTE_KEEPALIVE_MAXCORES];
+
+	/**
+	 * Cores to check.
+	 * Indexed by core id, non-zero if the core should be checked.
+	 */
+	uint8_t active_cores[RTE_KEEPALIVE_MAXCORES];
+
+	/** Dead core handler. */
+	rte_keepalive_failure_callback_t callback;
+
+	/**
+	 * Dead core handler app data.
+	 * Pointer is passed to dead core handler.
+	 */
+	void *callback_data;
+	uint64_t tsc_initial;
+	uint64_t tsc_mhz;
+
+	/** Core state relay handler. */
+	rte_keepalive_relay_callback_t relay_callback;
+
+	/**
+	 * Core state relay handler app data.
+	 * Pointer is passed to live core handler.
+	 */
+	void *relay_callback_data;
+};
 
 static void
 print_trace(const char *msg, struct rte_keepalive *keepcfg, int idx_core)
@@ -48,7 +84,6 @@ print_trace(const char *msg, struct rte_keepalive *keepcfg, int idx_core)
 		/ rte_get_tsc_hz()
 	      );
 }
-
 
 void
 rte_keepalive_dispatch_pings(__rte_unused void *ptr_timer,
@@ -62,16 +97,18 @@ rte_keepalive_dispatch_pings(__rte_unused void *ptr_timer,
 			continue;
 
 		switch (keepcfg->state_flags[idx_core]) {
-		case ALIVE: /* Alive */
-			keepcfg->state_flags[idx_core] = MISSING;
+		case RTE_KA_STATE_UNUSED:
+			break;
+		case RTE_KA_STATE_ALIVE: /* Alive */
+			keepcfg->state_flags[idx_core] = RTE_KA_STATE_MISSING;
 			keepcfg->last_alive[idx_core] = rte_rdtsc();
 			break;
-		case MISSING: /* MIA */
+		case RTE_KA_STATE_MISSING: /* MIA */
 			print_trace("Core MIA. ", keepcfg, idx_core);
-			keepcfg->state_flags[idx_core] = DEAD;
+			keepcfg->state_flags[idx_core] = RTE_KA_STATE_DEAD;
 			break;
-		case DEAD: /* Dead */
-			keepcfg->state_flags[idx_core] = GONE;
+		case RTE_KA_STATE_DEAD: /* Dead */
+			keepcfg->state_flags[idx_core] = RTE_KA_STATE_GONE;
 			print_trace("Core died. ", keepcfg, idx_core);
 			if (keepcfg->callback)
 				keepcfg->callback(
@@ -79,12 +116,24 @@ rte_keepalive_dispatch_pings(__rte_unused void *ptr_timer,
 					idx_core
 					);
 			break;
-		case GONE: /* Buried */
+		case RTE_KA_STATE_GONE: /* Buried */
+			break;
+		case RTE_KA_STATE_DOZING: /* Core going idle */
+			keepcfg->state_flags[idx_core] = RTE_KA_STATE_SLEEP;
+			keepcfg->last_alive[idx_core] = rte_rdtsc();
+			break;
+		case RTE_KA_STATE_SLEEP: /* Idled core */
 			break;
 		}
+		if (keepcfg->relay_callback)
+			keepcfg->relay_callback(
+				keepcfg->relay_callback_data,
+				idx_core,
+				keepcfg->state_flags[idx_core],
+				keepcfg->last_alive[idx_core]
+				);
 	}
 }
-
 
 struct rte_keepalive *
 rte_keepalive_create(rte_keepalive_failure_callback_t callback,
@@ -104,10 +153,31 @@ rte_keepalive_create(rte_keepalive_failure_callback_t callback,
 	return keepcfg;
 }
 
+void rte_keepalive_register_relay_callback(struct rte_keepalive *keepcfg,
+	rte_keepalive_relay_callback_t callback,
+	void *data)
+{
+	keepcfg->relay_callback = callback;
+	keepcfg->relay_callback_data = data;
+}
 
 void
 rte_keepalive_register_core(struct rte_keepalive *keepcfg, const int id_core)
 {
-	if (id_core < RTE_KEEPALIVE_MAXCORES)
-		keepcfg->active_cores[id_core] = 1;
+	if (id_core < RTE_KEEPALIVE_MAXCORES) {
+		keepcfg->active_cores[id_core] = RTE_KA_STATE_ALIVE;
+		keepcfg->last_alive[id_core] = rte_rdtsc();
+	}
+}
+
+void
+rte_keepalive_mark_alive(struct rte_keepalive *keepcfg)
+{
+	keepcfg->state_flags[rte_lcore_id()] = RTE_KA_STATE_ALIVE;
+}
+
+void
+rte_keepalive_mark_sleep(struct rte_keepalive *keepcfg)
+{
+	keepcfg->state_flags[rte_lcore_id()] = RTE_KA_STATE_DOZING;
 }

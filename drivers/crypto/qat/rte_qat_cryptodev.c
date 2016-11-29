@@ -1,7 +1,7 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright(c) 2015 Intel Corporation. All rights reserved.
+ *   Copyright(c) 2015-2016 Intel Corporation. All rights reserved.
  *   All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
@@ -69,10 +69,7 @@ static struct rte_cryptodev_ops crypto_qat_ops = {
 
 static struct rte_pci_id pci_id_qat_map[] = {
 		{
-			.vendor_id = 0x8086,
-			.device_id = 0x0443,
-			.subsystem_vendor_id = PCI_ANY_ID,
-			.subsystem_device_id = PCI_ANY_ID
+			RTE_PCI_DEVICE(0x8086, 0x0443),
 		},
 		{.device_id = 0},
 };
@@ -89,12 +86,15 @@ crypto_qat_dev_init(__attribute__((unused)) struct rte_cryptodev_driver *crypto_
 		cryptodev->pci_dev->addr.devid,
 		cryptodev->pci_dev->addr.function);
 
-	cryptodev->dev_type = RTE_CRYPTODEV_QAT_PMD;
+	cryptodev->dev_type = RTE_CRYPTODEV_QAT_SYM_PMD;
 	cryptodev->dev_ops = &crypto_qat_ops;
 
-	cryptodev->enqueue_burst = qat_crypto_pkt_tx_burst;
-	cryptodev->dequeue_burst = qat_crypto_pkt_rx_burst;
+	cryptodev->enqueue_burst = qat_pmd_enqueue_op_burst;
+	cryptodev->dequeue_burst = qat_pmd_dequeue_op_burst;
 
+	cryptodev->feature_flags = RTE_CRYPTODEV_FF_SYMMETRIC_CRYPTO |
+			RTE_CRYPTODEV_FF_HW_ACCELERATED |
+			RTE_CRYPTODEV_FF_SYM_OPERATION_CHAINING;
 
 	internals = cryptodev->data->dev_private;
 	internals->max_nb_sessions = RTE_QAT_PMD_MAX_NB_SESSIONS;
@@ -114,7 +114,6 @@ crypto_qat_dev_init(__attribute__((unused)) struct rte_cryptodev_driver *crypto_
 
 static struct rte_cryptodev_driver rte_qat_pmd = {
 	{
-		.name = "rte_qat_pmd",
 		.id_table = pci_id_qat_map,
 		.drv_flags = RTE_PCI_DRV_NEED_MAPPING,
 	},
@@ -134,4 +133,6 @@ static struct rte_driver pmd_qat_drv = {
 	.init = rte_qat_pmd_init,
 };
 
-PMD_REGISTER_DRIVER(pmd_qat_drv);
+PMD_REGISTER_DRIVER(pmd_qat_drv, CRYPTODEV_NAME_QAT_SYM_PMD);
+DRIVER_REGISTER_PCI_TABLE(CRYPTODEV_NAME_QAT_SYM_PMD, pci_id_qat_map);
+

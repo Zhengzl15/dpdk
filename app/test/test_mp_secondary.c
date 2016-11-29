@@ -232,7 +232,12 @@ run_object_creation_tests(void)
 
 #ifdef RTE_LIBRTE_LPM
 	rte_errno=0;
-	if ((rte_lpm_create("test_lpm", size, rte_socket_id(), 0) != NULL) &&
+	struct rte_lpm_config config;
+
+	config.max_rules = rte_socket_id();
+	config.number_tbl8s = 256;
+	config.flags = 0;
+	if ((rte_lpm_create("test_lpm", size, &config) != NULL) &&
 	    (rte_lpm_find_existing("test_lpm") == NULL)){
 		printf("Error: unexpected return value from rte_lpm_create()\n");
 		return -1;
@@ -240,6 +245,7 @@ run_object_creation_tests(void)
 	printf("# Checked rte_lpm_create() OK\n");
 #endif
 
+#ifdef RTE_APP_TEST_RESOURCE_TAR
 	/* Run a test_pci call */
 	if (test_pci() != 0) {
 		printf("PCI scan failed in secondary\n");
@@ -247,6 +253,7 @@ run_object_creation_tests(void)
 			return -1;
 	} else
 		printf("PCI scan succeeded in secondary\n");
+#endif
 
 	return 0;
 }
@@ -261,9 +268,11 @@ test_mp_secondary(void)
 {
 	if (rte_eal_process_type() == RTE_PROC_PRIMARY) {
 		if (!test_pci_run) {
+#ifdef RTE_APP_TEST_RESOURCE_TAR
 			printf("=== Running pre-requisite test of test_pci\n");
 			test_pci();
 			printf("=== Requisite test done\n");
+#endif
 		}
 		return run_secondary_instances();
 	}
@@ -273,8 +282,4 @@ test_mp_secondary(void)
 	return run_object_creation_tests();
 }
 
-static struct test_command multiprocess_cmd = {
-	.command = "multiprocess_autotest",
-	.callback = test_mp_secondary,
-};
-REGISTER_TEST_COMMAND(multiprocess_cmd);
+REGISTER_TEST_COMMAND(multiprocess_autotest, test_mp_secondary);

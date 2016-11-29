@@ -85,7 +85,7 @@ struct rte_jobstats {
 	/**< Minimum execute time. */
 
 	uint64_t max_exec_time;
-	/**< Minimum execute time. */
+	/**< Maximum execute time. */
 
 	uint64_t exec_cnt;
 	/**< Execute count. */
@@ -235,6 +235,20 @@ rte_jobstats_set_target(struct rte_jobstats *job, int64_t target);
  */
 int
 rte_jobstats_start(struct rte_jobstats_context *ctx, struct rte_jobstats *job);
+
+/**
+ * Mark that *job* finished its execution, but time of this work will be skipped
+ * and added to management time.
+ *
+ * @param job
+ *  Job object.
+ *
+ * @return
+ *  0 on success
+ *  -EINVAL if job is NULL or job was not started (it have no context).
+ */
+int
+rte_jobstats_abort(struct rte_jobstats *job);
 
 /**
  * Mark that *job* finished its execution. Context in which it was executing

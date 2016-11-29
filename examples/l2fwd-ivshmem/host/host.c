@@ -41,7 +41,6 @@
 #include <signal.h>
 
 #include <rte_eal.h>
-#include <rte_config.h>
 #include <rte_cycles.h>
 #include <rte_eal_memconfig.h>
 #include <rte_debug.h>
@@ -111,7 +110,8 @@ static void
 print_stats(void)
 {
 	uint64_t total_packets_dropped, total_packets_tx, total_packets_rx;
-	uint64_t total_vm_packets_dropped, total_vm_packets_tx, total_vm_packets_rx;
+	uint64_t total_vm_packets_dropped = 0;
+	uint64_t total_vm_packets_tx, total_vm_packets_rx;
 	unsigned portid;
 
 	total_packets_dropped = 0;
@@ -372,7 +372,7 @@ check_all_ports_link_status(uint8_t port_num, uint32_t port_mask)
 				continue;
 			}
 			/* clear all_ports_up flag if any link down */
-			if (link.link_status == 0) {
+			if (link.link_status == ETH_LINK_DOWN) {
 				all_ports_up = 0;
 				break;
 			}
@@ -677,9 +677,6 @@ int main(int argc, char **argv)
 	nb_ports = rte_eth_dev_count();
 	if (nb_ports == 0)
 		rte_exit(EXIT_FAILURE, "No Ethernet ports - bye\n");
-
-	if (nb_ports > RTE_MAX_ETHPORTS)
-		nb_ports = RTE_MAX_ETHPORTS;
 
 	/*
 	 * reserve memzone to communicate with VMs - we cannot use rte_malloc here

@@ -50,13 +50,10 @@ CFLAGS += $(WERROR_FLAGS)
 #
 SRCS-$(CONFIG_RTE_LIBRTE_PMD_AF_PACKET) += rte_eth_af_packet.c
 
-#
-# Export include files
-#
-SYMLINK-y-include += rte_eth_af_packet.h
-
 # this lib depends upon:
+DEPDIRS-$(CONFIG_RTE_LIBRTE_PMD_AF_PACKET) += lib/librte_eal
 DEPDIRS-$(CONFIG_RTE_LIBRTE_PMD_AF_PACKET) += lib/librte_mbuf
+DEPDIRS-$(CONFIG_RTE_LIBRTE_PMD_AF_PACKET) += lib/librte_mempool
 DEPDIRS-$(CONFIG_RTE_LIBRTE_PMD_AF_PACKET) += lib/librte_ether
 DEPDIRS-$(CONFIG_RTE_LIBRTE_PMD_AF_PACKET) += lib/librte_kvargs
 

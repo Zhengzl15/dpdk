@@ -44,7 +44,9 @@
 
 #include "rte_table_lpm.h"
 
-#define RTE_TABLE_LPM_MAX_NEXT_HOPS                        256
+#ifndef RTE_TABLE_LPM_MAX_NEXT_HOPS
+#define RTE_TABLE_LPM_MAX_NEXT_HOPS                        65536
+#endif
 
 #ifdef RTE_TABLE_STATS_COLLECT
 
@@ -82,6 +84,8 @@ rte_table_lpm_create(void *params, int socket_id, uint32_t entry_size)
 {
 	struct rte_table_lpm_params *p = (struct rte_table_lpm_params *) params;
 	struct rte_table_lpm *lpm;
+	struct rte_lpm_config lpm_config;
+
 	uint32_t total_size, nht_size;
 
 	/* Check input parameters */
@@ -91,6 +95,10 @@ rte_table_lpm_create(void *params, int socket_id, uint32_t entry_size)
 	}
 	if (p->n_rules == 0) {
 		RTE_LOG(ERR, TABLE, "%s: Invalid n_rules\n", __func__);
+		return NULL;
+	}
+	if (p->number_tbl8s == 0) {
+		RTE_LOG(ERR, TABLE, "%s: Invalid number_tbl8s\n", __func__);
 		return NULL;
 	}
 	if (p->entry_unique_size == 0) {
@@ -123,7 +131,11 @@ rte_table_lpm_create(void *params, int socket_id, uint32_t entry_size)
 	}
 
 	/* LPM low-level table creation */
-	lpm->lpm = rte_lpm_create(p->name, socket_id, p->n_rules, 0);
+	lpm_config.max_rules = p->n_rules;
+	lpm_config.number_tbl8s = p->number_tbl8s;
+	lpm_config.flags = p->flags;
+	lpm->lpm = rte_lpm_create(p->name, socket_id, &lpm_config);
+
 	if (lpm->lpm == NULL) {
 		rte_free(lpm);
 		RTE_LOG(ERR, TABLE, "Unable to create low-level LPM table\n");
@@ -202,7 +214,7 @@ rte_table_lpm_entry_add(
 	struct rte_table_lpm_key *ip_prefix = (struct rte_table_lpm_key *) key;
 	uint32_t nht_pos, nht_pos0_valid;
 	int status;
-	uint8_t nht_pos0 = 0;
+	uint32_t nht_pos0 = 0;
 
 	/* Check input parameters */
 	if (lpm == NULL) {
@@ -244,8 +256,7 @@ rte_table_lpm_entry_add(
 	}
 
 	/* Add rule to low level LPM table */
-	if (rte_lpm_add(lpm->lpm, ip_prefix->ip, ip_prefix->depth,
-		(uint8_t) nht_pos) < 0) {
+	if (rte_lpm_add(lpm->lpm, ip_prefix->ip, ip_prefix->depth, nht_pos) < 0) {
 		RTE_LOG(ERR, TABLE, "%s: LPM rule add failed\n", __func__);
 		return -1;
 	}
@@ -268,7 +279,7 @@ rte_table_lpm_entry_delete(
 {
 	struct rte_table_lpm *lpm = (struct rte_table_lpm *) table;
 	struct rte_table_lpm_key *ip_prefix = (struct rte_table_lpm_key *) key;
-	uint8_t nht_pos;
+	uint32_t nht_pos;
 	int status;
 
 	/* Check input parameters */
@@ -342,7 +353,7 @@ rte_table_lpm_lookup(
 			uint32_t ip = rte_bswap32(
 				RTE_MBUF_METADATA_UINT32(pkt, lpm->offset));
 			int status;
-			uint8_t nht_pos;
+			uint32_t nht_pos;
 
 			status = rte_lpm_lookup(lpm->lpm, ip, &nht_pos);
 			if (status == 0) {

@@ -49,6 +49,7 @@ $(1): $(sort $(LOCAL_DEPDIRS-$(1)))
 endef
 
 $(foreach d,$(ROOTDIRS-y),$(eval $(call depdirs_rule,$(d))))
+drivers: | buildtools
 
 #
 # build and clean targets
@@ -63,7 +64,7 @@ build: $(ROOTDIRS-y)
 .PHONY: clean
 clean: $(CLEANDIRS)
 	@rm -rf $(RTE_OUTPUT)/include $(RTE_OUTPUT)/app \
-		$(RTE_OUTPUT)/hostapp $(RTE_OUTPUT)/lib \
+		$(RTE_OUTPUT)/lib \
 		$(RTE_OUTPUT)/hostlib $(RTE_OUTPUT)/kmod
 	@[ -d $(RTE_OUTPUT)/include ] || mkdir -p $(RTE_OUTPUT)/include
 	@$(RTE_SDK)/scripts/gen-config-h.sh $(RTE_OUTPUT)/.config \
@@ -77,8 +78,8 @@ $(ROOTDIRS-y):
 	@[ -d $(BUILDDIR)/$@ ] || mkdir -p $(BUILDDIR)/$@
 	@echo "== Build $@"
 	$(Q)$(MAKE) S=$@ -f $(RTE_SRCDIR)/$@/Makefile -C $(BUILDDIR)/$@ all
-	@if [ $@ = drivers -a $(CONFIG_RTE_BUILD_COMBINE_LIBS) = y ]; then \
-		$(MAKE) -f $(RTE_SDK)/lib/Makefile sharelib; \
+	@if [ $@ = drivers ]; then \
+		$(MAKE) -f $(RTE_SDK)/mk/rte.combinedlib.mk; \
 	fi
 
 %_clean:

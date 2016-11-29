@@ -1,6 +1,6 @@
 #   BSD LICENSE
 #
-#   Copyright(c) 2010-2014 Intel Corporation. All rights reserved.
+#   Copyright(c) 2010-2016 Intel Corporation. All rights reserved.
 #   All rights reserved.
 #
 #   Redistribution and use in source and binary forms, with or without
@@ -41,7 +41,7 @@ CFLAGS += $(WERROR_FLAGS)
 
 EXPORT_MAP := rte_pipeline_version.map
 
-LIBABIVER := 2
+LIBABIVER := 3
 
 #
 # all source are stored in SRCS-y
@@ -52,7 +52,10 @@ SRCS-$(CONFIG_RTE_LIBRTE_PIPELINE) := rte_pipeline.c
 SYMLINK-$(CONFIG_RTE_LIBRTE_PIPELINE)-include += rte_pipeline.h
 
 # this lib depends upon:
-DEPDIRS-$(CONFIG_RTE_LIBRTE_PIPELINE) := lib/librte_table
+DEPDIRS-$(CONFIG_RTE_LIBRTE_PIPELINE) += lib/librte_eal
+DEPDIRS-$(CONFIG_RTE_LIBRTE_PIPELINE) += lib/librte_mbuf
+DEPDIRS-$(CONFIG_RTE_LIBRTE_PIPELINE) += lib/librte_mempool
+DEPDIRS-$(CONFIG_RTE_LIBRTE_PIPELINE) += lib/librte_table
 DEPDIRS-$(CONFIG_RTE_LIBRTE_PIPELINE) += lib/librte_port
 
 include $(RTE_SDK)/mk/rte.lib.mk

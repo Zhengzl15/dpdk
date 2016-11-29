@@ -49,9 +49,6 @@ int rte_eal_memzone_init(void);
 /**
  * Common log initialization function (private to eal).
  *
- * Called by environment-specific log initialization function to initialize
- * log history.
- *
  * @param default_log
  *   The default log stream to be used.
  * @return
@@ -163,24 +160,6 @@ struct rte_pci_device;
  *   0 on success, negative on error
  */
 int pci_unbind_kernel_driver(struct rte_pci_device *dev);
-
-/**
- * Map this device
- *
- * This function is private to EAL.
- *
- * @return
- *   0 on success, negative on error and positive if no driver
- *   is found for the device.
- */
-int pci_map_device(struct rte_pci_device *dev);
-
-/**
- * Unmap this device
- *
- * This function is private to EAL.
- */
-void pci_unmap_device(struct rte_pci_device *dev);
 
 /**
  * Map the PCI resource of a PCI device in virtual memory

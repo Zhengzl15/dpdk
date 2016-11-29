@@ -42,7 +42,6 @@
 
 
 #include <rte_log.h>
-#include <rte_config.h>
 
 #include "guest_channel.h"
 #include "channel_commands.h"
@@ -104,8 +103,10 @@ guest_channel_host_connect(const char *path, unsigned lcore_id)
 	global_fds[lcore_id] = fd;
 	ret = guest_channel_send_msg(&pkt, lcore_id);
 	if (ret != 0) {
-		RTE_LOG(ERR, GUEST_CHANNEL, "Error on channel '%s' communications "
-				"test: %s\n", fd_path, strerror(ret));
+		RTE_LOG(ERR, GUEST_CHANNEL,
+				"Error on channel '%s' communications test: %s\n",
+				fd_path, ret > 0 ? strerror(ret) :
+				"channel not connected");
 		goto error;
 	}
 	RTE_LOG(INFO, GUEST_CHANNEL, "Channel '%s' is now connected\n", fd_path);

@@ -79,7 +79,13 @@ static size_t buf_sizes[TEST_VALUE_RANGE];
 #define TEST_BATCH_SIZE         100
 
 /* Data is aligned on this many bytes (power of 2) */
+#ifdef RTE_MACHINE_CPUFLAG_AVX512F
+#define ALIGNMENT_UNIT          64
+#elif defined RTE_MACHINE_CPUFLAG_AVX2
 #define ALIGNMENT_UNIT          32
+#else /* RTE_MACHINE_CPUFLAG */
+#define ALIGNMENT_UNIT          16
+#endif /* RTE_MACHINE_CPUFLAG */
 
 /*
  * Pointers used in performance tests. The two large buffers are for uncached
@@ -146,8 +152,8 @@ free_buffers(void)
 static inline size_t
 get_rand_offset(size_t uoffset)
 {
-	return (((rte_rand() % (LARGE_BUFFER_SIZE - SMALL_BUFFER_SIZE)) &
-			~(ALIGNMENT_UNIT - 1)) + uoffset);
+	return ((rte_rand() % (LARGE_BUFFER_SIZE - SMALL_BUFFER_SIZE)) &
+			~(ALIGNMENT_UNIT - 1)) + uoffset;
 }
 
 /* Fill in source and destination addresses. */
@@ -345,8 +351,4 @@ test_memcpy_perf(void)
 	return 0;
 }
 
-static struct test_command memcpy_perf_cmd = {
-	.command = "memcpy_perf_autotest",
-	.callback = test_memcpy_perf,
-};
-REGISTER_TEST_COMMAND(memcpy_perf_cmd);
+REGISTER_TEST_COMMAND(memcpy_perf_autotest, test_memcpy_perf);

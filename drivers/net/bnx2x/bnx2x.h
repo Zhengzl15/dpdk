@@ -128,9 +128,6 @@ struct bnx2x_device_type {
 	char     *bnx2x_name;
 };
 
-#define RTE_MBUF_DATA_DMA_ADDR(mb) \
-	((uint64_t)((mb)->buf_physaddr + (mb)->data_off))
-
 #define BNX2X_PAGE_SHIFT       12
 #define BNX2X_PAGE_SIZE        (1 << BNX2X_PAGE_SHIFT)
 #define BNX2X_PAGE_MASK        (~(BNX2X_PAGE_SIZE - 1))
@@ -151,23 +148,6 @@ struct bnx2x_device_type {
 #define FW_PREFETCH_CNT      16U
 #define DROPLESS_FC_HEADROOM 100
 
-#ifndef MCLSHIFT
-#define MCLSHIFT                              11
-#endif
-#define MCLBYTES                              (1 << MCLSHIFT)
-
-#if !defined(MJUMPAGESIZE)
-#if BNX2X_PAGE_SIZE < 2048
-#define MJUMPAGESIZE    MCLBYTES
-#elif BNX2X_PAGE_SIZE <= 8192
-#define MJUMPAGESIZE    BNX2X_PAGE_SIZE
-#else
-#define MJUMPAGESIZE    (8 * 1024)
-#endif
-#endif
-#define MJUM9BYTES      (9 * 1024)
-#define MJUM16BYTES     (16 * 1024)
-
 /*
  * Transmit Buffer Descriptor (tx_bd) definitions*
  */
@@ -186,6 +166,8 @@ struct bnx2x_device_type {
 #define TX_BD(x, q)             ((x) & MAX_TX_BD(q))
 #define TX_PAGE(x)              (((x) & ~USABLE_TX_BD_PER_PAGE) >> 8)
 #define TX_IDX(x)               ((x) & USABLE_TX_BD_PER_PAGE)
+
+#define BDS_PER_TX_PKT		(3)
 
 /*
  * Trigger pending transmits when the number of available BDs is greater
@@ -402,7 +384,6 @@ struct bnx2x_fastpath {
 	uint8_t fw_sb_id;  /* status block number in FW */
 
 	uint32_t rx_buf_size;
-	int mbuf_alloc_size;
 
 	int state;
 #define BNX2X_FP_STATE_CLOSED  0x01
@@ -1839,7 +1820,7 @@ bnx2x_ack_int(struct bnx2x_softc *sc)
 static inline int
 func_by_vn(struct bnx2x_softc *sc, int vn)
 {
-    return (2 * vn + SC_PORT(sc));
+    return 2 * vn + SC_PORT(sc);
 }
 
 /*
@@ -1874,7 +1855,7 @@ bnx2x_stats_id(struct bnx2x_fastpath *fp)
 	return fp->cl_id;
     }
 
-    return (fp->cl_id + SC_PORT(sc) * FP_SB_MAX_E1x);
+    return fp->cl_id + SC_PORT(sc) * FP_SB_MAX_E1x;
 }
 
 int bnx2x_init(struct bnx2x_softc *sc);
@@ -1885,7 +1866,7 @@ int bnx2x_alloc_hsi_mem(struct bnx2x_softc *sc);
 int bnx2x_alloc_ilt_mem(struct bnx2x_softc *sc);
 void bnx2x_free_ilt_mem(struct bnx2x_softc *sc);
 void bnx2x_dump_tx_chain(struct bnx2x_fastpath * fp, int bd_prod, int count);
-int bnx2x_tx_encap(struct bnx2x_tx_queue *txq, struct rte_mbuf **m_head, int m_pkts);
+int bnx2x_tx_encap(struct bnx2x_tx_queue *txq, struct rte_mbuf *m0);
 uint8_t bnx2x_txeof(struct bnx2x_softc *sc, struct bnx2x_fastpath *fp);
 void bnx2x_print_adapter_info(struct bnx2x_softc *sc);
 int bnx2x_intr_legacy(struct bnx2x_softc *sc, int scan_fp);
@@ -1923,14 +1904,6 @@ pci_find_cap(struct bnx2x_softc *sc, uint8_t id, uint8_t type)
 	}
 
 	return NULL;
-}
-
-static inline int is_valid_ether_addr(uint8_t *addr)
-{
-	if (!(addr[0] | addr[1] | addr[2] | addr[3] | addr[4] | addr[5]))
-		return 0;
-	else
-		return 1;
 }
 
 static inline void

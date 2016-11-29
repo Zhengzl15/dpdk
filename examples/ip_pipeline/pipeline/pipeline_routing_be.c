@@ -1,7 +1,7 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright(c) 2010-2015 Intel Corporation. All rights reserved.
+ *   Copyright(c) 2010-2016 Intel Corporation. All rights reserved.
  *   All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
@@ -47,6 +47,7 @@
 
 #include "pipeline_routing_be.h"
 #include "pipeline_actions_common.h"
+#include "parser.h"
 #include "hash_func.h"
 
 #define MPLS_LABEL(label, exp, s, ttl)					\
@@ -64,12 +65,19 @@
 	((((uint64_t) (pipe)) & 0xFFFFFFFF) << 32))
 
 
-#define MAC_SRC_DEFAULT 0x112233445566
+/* Network Byte Order (NBO) */
+#define SLAB_NBO_MACADDRSRC_ETHERTYPE(macaddr, ethertype)	\
+	(((uint64_t) macaddr) | (((uint64_t) rte_cpu_to_be_16(ethertype)) << 48))
+
+#ifndef PIPELINE_ROUTING_LPM_TABLE_NUMBER_TABLE8s
+#define PIPELINE_ROUTING_LPM_TABLE_NUMBER_TABLE8s 256
+#endif
 
 struct pipeline_routing {
 	struct pipeline p;
 	struct pipeline_routing_params params;
 	pipeline_msg_req_handler custom_handlers[PIPELINE_ROUTING_MSG_REQS];
+	uint64_t macaddr[PIPELINE_MAX_PORT_OUT];
 } __rte_cache_aligned;
 
 /*
@@ -127,6 +135,10 @@ static void *
 pipeline_routing_msg_req_arp_del_default_handler(struct pipeline *p,
 	void *msg);
 
+static void *
+pipeline_routing_msg_req_set_macaddr_handler(struct pipeline *p,
+	void *msg);
+
 static pipeline_msg_req_handler custom_handlers[] = {
 	[PIPELINE_ROUTING_MSG_REQ_ROUTE_ADD] =
 		pipeline_routing_msg_req_route_add_handler,
@@ -144,6 +156,8 @@ static pipeline_msg_req_handler custom_handlers[] = {
 		pipeline_routing_msg_req_arp_add_default_handler,
 	[PIPELINE_ROUTING_MSG_REQ_ARP_DEL_DEFAULT] =
 		pipeline_routing_msg_req_arp_del_default_handler,
+	[PIPELINE_ROUTING_MSG_REQ_SET_MACADDR] =
+		pipeline_routing_msg_req_set_macaddr_handler,
 };
 
 /*
@@ -916,6 +930,7 @@ pipeline_routing_parse_args(struct pipeline_routing_params *p,
 	struct pipeline_params *params)
 {
 	uint32_t n_routes_present = 0;
+	uint32_t port_local_dest_present = 0;
 	uint32_t encap_present = 0;
 	uint32_t qinq_sched_present = 0;
 	uint32_t mpls_color_mark_present = 0;
@@ -928,6 +943,7 @@ pipeline_routing_parse_args(struct pipeline_routing_params *p,
 
 	/* default values */
 	p->n_routes = PIPELINE_ROUTING_N_ROUTES_DEFAULT;
+	p->port_local_dest = params->n_ports_out - 1;
 	p->encap = PIPELINE_ROUTING_ENCAP_ETHERNET;
 	p->qinq_sched = 0;
 	p->mpls_color_mark = 0;
@@ -940,21 +956,45 @@ pipeline_routing_parse_args(struct pipeline_routing_params *p,
 
 		/* n_routes */
 		if (strcmp(arg_name, "n_routes") == 0) {
-			if (n_routes_present)
-				return -1;
+			int status;
+
+			PIPELINE_PARSE_ERR_DUPLICATE(
+				n_routes_present == 0, params->name,
+				arg_name);
 			n_routes_present = 1;
 
-			p->n_routes = atoi(arg_value);
-			if (p->n_routes == 0)
-				return -1;
+			status = parser_read_uint32(&p->n_routes,
+				arg_value);
+			PIPELINE_PARSE_ERR_INV_VAL(((status != -EINVAL) &&
+				(p->n_routes != 0)), params->name,
+				arg_name, arg_value);
+			PIPELINE_PARSE_ERR_OUT_RNG((status != -ERANGE),
+				params->name, arg_name, arg_value);
+
+			continue;
+		}
+		/* port_local_dest */
+		if (strcmp(arg_name, "port_local_dest") == 0) {
+			int status;
+
+			PIPELINE_PARSE_ERR_DUPLICATE(
+				port_local_dest_present == 0, params->name,
+				arg_name);
+			port_local_dest_present = 1;
+
+			status = parser_read_uint32(&p->port_local_dest,
+				arg_value);
+			PIPELINE_PARSE_ERR_INV_VAL(((status == 0) &&
+				(p->port_local_dest < params->n_ports_out)),
+				params->name, arg_name, arg_value);
 
 			continue;
 		}
 
 		/* encap */
 		if (strcmp(arg_name, "encap") == 0) {
-			if (encap_present)
-				return -1;
+			PIPELINE_PARSE_ERR_DUPLICATE(encap_present == 0,
+				params->name, arg_name);
 			encap_present = 1;
 
 			/* ethernet */
@@ -976,140 +1016,204 @@ pipeline_routing_parse_args(struct pipeline_routing_params *p,
 			}
 
 			/* any other */
-			return -1;
+			PIPELINE_PARSE_ERR_INV_VAL(0, params->name,
+				arg_name, arg_value);
 		}
 
 		/* qinq_sched */
 		if (strcmp(arg_name, "qinq_sched") == 0) {
-			if (qinq_sched_present)
-				return -1;
+			int status;
 
+			PIPELINE_PARSE_ERR_DUPLICATE(
+				qinq_sched_present == 0, params->name,
+				arg_name);
 			qinq_sched_present = 1;
 
-			if (strcmp(arg_value, "no") == 0)
-				p->qinq_sched = 0;
-			else if (strcmp(arg_value, "yes") == 0)
-				p->qinq_sched = 1;
-			else if (strcmp(arg_value, "test") == 0)
-				p->qinq_sched = 2;
-			else
-				return -1;
+			status = parser_read_arg_bool(arg_value);
+			if (status == -EINVAL) {
+				if (strcmp(arg_value, "test") == 0) {
+					p->qinq_sched = 2;
+					continue;
+				}
+			} else {
+				p->qinq_sched = status;
+				continue;
+			}
 
-			continue;
+			PIPELINE_PARSE_ERR_INV_VAL(0, params->name,
+				arg_name, arg_value);
 		}
 
 		/* mpls_color_mark */
 		if (strcmp(arg_name, "mpls_color_mark") == 0) {
-			if (mpls_color_mark_present)
-				return -1;
+			int status;
 
+			PIPELINE_PARSE_ERR_DUPLICATE(
+				mpls_color_mark_present == 0,
+				params->name, arg_name);
 			mpls_color_mark_present = 1;
 
-			if (strcmp(arg_value, "no") == 0)
-				p->mpls_color_mark = 0;
-			else if (strcmp(arg_value, "yes") == 0)
-				p->mpls_color_mark = 1;
-			else
-				return -1;
 
-			continue;
+			status = parser_read_arg_bool(arg_value);
+			if (status >= 0) {
+				p->mpls_color_mark = status;
+				continue;
+			}
+
+			PIPELINE_PARSE_ERR_INV_VAL(0, params->name,
+				arg_name, arg_value);
 		}
 
 		/* n_arp_entries */
 		if (strcmp(arg_name, "n_arp_entries") == 0) {
-			if (n_arp_entries_present)
-				return -1;
+			int status;
+
+			PIPELINE_PARSE_ERR_DUPLICATE(
+				n_arp_entries_present == 0, params->name,
+				arg_name);
 			n_arp_entries_present = 1;
 
-			p->n_arp_entries = atoi(arg_value);
+			status = parser_read_uint32(&p->n_arp_entries,
+				arg_value);
+			PIPELINE_PARSE_ERR_INV_VAL((status != -EINVAL),
+				params->name, arg_name, arg_value);
+			PIPELINE_PARSE_ERR_OUT_RNG((status != -ERANGE),
+				params->name, arg_name, arg_value);
 
 			continue;
 		}
 
 		/* ip_hdr_offset */
 		if (strcmp(arg_name, "ip_hdr_offset") == 0) {
-			if (ip_hdr_offset_present)
-				return -1;
+			int status;
+
+			PIPELINE_PARSE_ERR_DUPLICATE(
+				ip_hdr_offset_present == 0, params->name,
+				arg_name);
 			ip_hdr_offset_present = 1;
 
-			p->ip_hdr_offset = atoi(arg_value);
+			status = parser_read_uint32(&p->ip_hdr_offset,
+				arg_value);
+			PIPELINE_PARSE_ERR_INV_VAL((status != -EINVAL),
+				params->name, arg_name, arg_value);
+			PIPELINE_PARSE_ERR_OUT_RNG((status != -ERANGE),
+				params->name, arg_name, arg_value);
 
 			continue;
 		}
 
 		/* arp_key_offset */
 		if (strcmp(arg_name, "arp_key_offset") == 0) {
-			if (arp_key_offset_present)
-				return -1;
+			int status;
+
+			PIPELINE_PARSE_ERR_DUPLICATE(
+				arp_key_offset_present == 0, params->name,
+				arg_name);
 			arp_key_offset_present = 1;
 
-			p->arp_key_offset = atoi(arg_value);
+			status = parser_read_uint32(&p->arp_key_offset,
+				arg_value);
+			PIPELINE_PARSE_ERR_INV_VAL((status != -EINVAL),
+				params->name, arg_name, arg_value);
+			PIPELINE_PARSE_ERR_OUT_RNG((status != -ERANGE),
+				params->name, arg_name, arg_value);
 
 			continue;
 		}
 
 		/* color_offset */
 		if (strcmp(arg_name, "color_offset") == 0) {
-			if (color_offset_present)
-				return -1;
+			int status;
+
+			PIPELINE_PARSE_ERR_DUPLICATE(
+				color_offset_present == 0, params->name,
+				arg_name);
 			color_offset_present = 1;
 
-			p->color_offset = atoi(arg_value);
+			status = parser_read_uint32(&p->color_offset,
+				arg_value);
+			PIPELINE_PARSE_ERR_INV_VAL((status != -EINVAL),
+				params->name, arg_name, arg_value);
+			PIPELINE_PARSE_ERR_OUT_RNG((status != -ERANGE),
+				params->name, arg_name, arg_value);
 
 			continue;
 		}
 
 		/* debug */
 		if (strcmp(arg_name, "dbg_ah_disable") == 0) {
-			if (dbg_ah_disable_present)
-				return -1;
+			int status;
+
+			PIPELINE_PARSE_ERR_DUPLICATE(
+				dbg_ah_disable_present == 0, params->name,
+				arg_name);
 			dbg_ah_disable_present = 1;
 
-			if (strcmp(arg_value, "no") == 0)
-				p->dbg_ah_disable = 0;
-			else if (strcmp(arg_value, "yes") == 0)
-				p->dbg_ah_disable = 1;
-			else
-				return -1;
+			status = parser_read_arg_bool(arg_value);
+			if (status >= 0) {
+				p->dbg_ah_disable = status;
+				continue;
+			}
+
+			PIPELINE_PARSE_ERR_INV_VAL(0, params->name,
+				arg_name, arg_value);
 
 			continue;
 		}
 
 		/* any other */
-		return -1;
+		PIPELINE_PARSE_ERR_INV_ENT(0, params->name, arg_name);
 	}
 
 	/* Check that mandatory arguments are present */
-	if (ip_hdr_offset_present == 0)
-		return -1;
+	PIPELINE_PARSE_ERR_MANDATORY(ip_hdr_offset_present, params->name,
+		"ip_hdr_offset");
 
 	/* Check relations between arguments */
 	switch (p->encap) {
 	case PIPELINE_ROUTING_ENCAP_ETHERNET:
-		if (p->qinq_sched ||
-			p->mpls_color_mark ||
-			color_offset_present)
-			return -1;
+		PIPELINE_ARG_CHECK((!p->qinq_sched), "Parse error in "
+			"section \"%s\": encap = ethernet, therefore "
+			"qinq_sched = yes/test is not allowed",
+			params->name);
+		PIPELINE_ARG_CHECK((!p->mpls_color_mark), "Parse error "
+			"in section \"%s\": encap = ethernet, therefore "
+			"mpls_color_mark = yes is not allowed",
+			params->name);
+		PIPELINE_ARG_CHECK((!color_offset_present), "Parse error "
+			"in section \"%s\": encap = ethernet, therefore "
+			"color_offset is not allowed",
+			params->name);
 		break;
 
 	case PIPELINE_ROUTING_ENCAP_ETHERNET_QINQ:
-		if (p->mpls_color_mark ||
-			color_offset_present)
-			return -1;
+		PIPELINE_ARG_CHECK((!p->mpls_color_mark), "Parse error "
+			"in section \"%s\": encap = ethernet_qinq, "
+			"therefore mpls_color_mark = yes is not allowed",
+			params->name);
+		PIPELINE_ARG_CHECK((!color_offset_present), "Parse error "
+			"in section \"%s\": encap = ethernet_qinq, "
+			"therefore color_offset is not allowed",
+			params->name);
 		break;
 
 	case PIPELINE_ROUTING_ENCAP_ETHERNET_MPLS:
-		if (p->qinq_sched)
-			return -1;
+		PIPELINE_ARG_CHECK((!p->qinq_sched), "Parse error in "
+			"section \"%s\": encap = ethernet_mpls, therefore "
+			"qinq_sched  = yes/test is not allowed",
+			params->name);
 		break;
-
-	default:
-		return -1;
 	}
 
-	if ((p->n_arp_entries && (arp_key_offset_present == 0)) ||
-		((p->n_arp_entries == 0) && arp_key_offset_present))
-		return -1;
+	PIPELINE_ARG_CHECK((!(p->n_arp_entries &&
+		(!arp_key_offset_present))), "Parse error in section "
+			"\"%s\": n_arp_entries is set while "
+			"arp_key_offset is not set", params->name);
+
+	PIPELINE_ARG_CHECK((!((p->n_arp_entries == 0) &&
+		arp_key_offset_present)), "Parse error in section "
+			"\"%s\": arp_key_offset present while "
+			"n_arp_entries is not set", params->name);
 
 	return 0;
 }
@@ -1192,7 +1296,6 @@ pipeline_routing_init(struct pipeline_params *params,
 			.arg_create = pipeline_port_out_params_convert(
 				&params->port_out[i]),
 			.f_action = NULL,
-			.f_action_bulk = NULL,
 			.arg_ah = NULL,
 		};
 
@@ -1213,6 +1316,8 @@ pipeline_routing_init(struct pipeline_params *params,
 		struct rte_table_lpm_params table_lpm_params = {
 			.name = p->name,
 			.n_rules = p_rt->params.n_routes,
+			.number_tbl8s = PIPELINE_ROUTING_LPM_TABLE_NUMBER_TABLE8s,
+			.flags = 0,
 			.entry_unique_size = sizeof(struct routing_table_entry),
 			.offset = p_rt->params.ip_hdr_offset +
 				__builtin_offsetof(struct ipv4_hdr, dst_addr),
@@ -1342,27 +1447,6 @@ pipeline_routing_free(void *pipeline)
 }
 
 static int
-pipeline_routing_track(void *pipeline,
-	__rte_unused uint32_t port_in,
-	uint32_t *port_out)
-{
-	struct pipeline *p = (struct pipeline *) pipeline;
-
-	/* Check input arguments */
-	if ((p == NULL) ||
-		(port_in >= p->n_ports_in) ||
-		(port_out == NULL))
-		return -1;
-
-	if (p->n_ports_in == 1) {
-		*port_out = 0;
-		return 0;
-	}
-
-	return -1;
-}
-
-static int
 pipeline_routing_timer(void *pipeline)
 {
 	struct pipeline *p = (struct pipeline *) pipeline;
@@ -1457,7 +1541,7 @@ pipeline_routing_msg_req_route_add_handler(struct pipeline *p, void *msg)
 	/* Ether - ARP off */
 	if ((p_rt->params.encap == PIPELINE_ROUTING_ENCAP_ETHERNET) &&
 		(p_rt->params.n_arp_entries == 0)) {
-		uint64_t macaddr_src = MAC_SRC_DEFAULT;
+		uint64_t macaddr_src = p_rt->macaddr[req->data.port_id];
 		uint64_t macaddr_dst;
 		uint64_t ethertype = ETHER_TYPE_IPv4;
 
@@ -1465,7 +1549,7 @@ pipeline_routing_msg_req_route_add_handler(struct pipeline *p, void *msg)
 		macaddr_dst = rte_bswap64(macaddr_dst << 16);
 
 		entry_arp0.slab[0] =
-			rte_bswap64((macaddr_src << 16) | ethertype);
+			SLAB_NBO_MACADDRSRC_ETHERTYPE(macaddr_src, ethertype);
 		entry_arp0.slab_offset[0] = p_rt->params.ip_hdr_offset - 8;
 
 		entry_arp0.slab[1] = rte_bswap64(macaddr_dst);
@@ -1479,11 +1563,11 @@ pipeline_routing_msg_req_route_add_handler(struct pipeline *p, void *msg)
 	/* Ether - ARP on */
 	if ((p_rt->params.encap == PIPELINE_ROUTING_ENCAP_ETHERNET) &&
 		p_rt->params.n_arp_entries) {
-		uint64_t macaddr_src = MAC_SRC_DEFAULT;
+		uint64_t macaddr_src = p_rt->macaddr[req->data.port_id];
 		uint64_t ethertype = ETHER_TYPE_IPv4;
 
-		entry_arp1.slab[0] = rte_bswap64((macaddr_src << 16) |
-			ethertype);
+		entry_arp1.slab[0] =
+			SLAB_NBO_MACADDRSRC_ETHERTYPE(macaddr_src, ethertype);
 		entry_arp1.slab_offset[0] = p_rt->params.ip_hdr_offset - 8;
 
 		entry_arp1.data_offset = entry_arp1.slab_offset[0] - 6
@@ -1494,7 +1578,7 @@ pipeline_routing_msg_req_route_add_handler(struct pipeline *p, void *msg)
 	/* Ether QinQ - ARP off */
 	if ((p_rt->params.encap == PIPELINE_ROUTING_ENCAP_ETHERNET_QINQ) &&
 		(p_rt->params.n_arp_entries == 0)) {
-		uint64_t macaddr_src = MAC_SRC_DEFAULT;
+		uint64_t macaddr_src = p_rt->macaddr[req->data.port_id];
 		uint64_t macaddr_dst;
 		uint64_t ethertype_ipv4 = ETHER_TYPE_IPv4;
 		uint64_t ethertype_vlan = 0x8100;
@@ -1511,8 +1595,8 @@ pipeline_routing_msg_req_route_add_handler(struct pipeline *p, void *msg)
 			ethertype_ipv4);
 		entry_arp0.slab_offset[0] = p_rt->params.ip_hdr_offset - 8;
 
-		entry_arp0.slab[1] = rte_bswap64((macaddr_src << 16) |
-			ethertype_qinq);
+		entry_arp0.slab[1] =
+			SLAB_NBO_MACADDRSRC_ETHERTYPE(macaddr_src, ethertype_qinq);
 		entry_arp0.slab_offset[1] = p_rt->params.ip_hdr_offset - 2 * 8;
 
 		entry_arp0.slab[2] = rte_bswap64(macaddr_dst);
@@ -1526,7 +1610,7 @@ pipeline_routing_msg_req_route_add_handler(struct pipeline *p, void *msg)
 	/* Ether QinQ - ARP on */
 	if ((p_rt->params.encap == PIPELINE_ROUTING_ENCAP_ETHERNET_QINQ) &&
 		p_rt->params.n_arp_entries) {
-		uint64_t macaddr_src = MAC_SRC_DEFAULT;
+		uint64_t macaddr_src = p_rt->macaddr[req->data.port_id];
 		uint64_t ethertype_ipv4 = ETHER_TYPE_IPv4;
 		uint64_t ethertype_vlan = 0x8100;
 		uint64_t ethertype_qinq = 0x9100;
@@ -1539,8 +1623,8 @@ pipeline_routing_msg_req_route_add_handler(struct pipeline *p, void *msg)
 			ethertype_ipv4);
 		entry_arp1.slab_offset[0] = p_rt->params.ip_hdr_offset - 8;
 
-		entry_arp1.slab[1] = rte_bswap64((macaddr_src << 16) |
-			ethertype_qinq);
+		entry_arp1.slab[1] =
+			SLAB_NBO_MACADDRSRC_ETHERTYPE(macaddr_src, ethertype_qinq);
 		entry_arp1.slab_offset[1] = p_rt->params.ip_hdr_offset - 2 * 8;
 
 		entry_arp1.data_offset = entry_arp1.slab_offset[1] - 6
@@ -1551,7 +1635,7 @@ pipeline_routing_msg_req_route_add_handler(struct pipeline *p, void *msg)
 	/* Ether MPLS - ARP off */
 	if ((p_rt->params.encap == PIPELINE_ROUTING_ENCAP_ETHERNET_MPLS) &&
 		(p_rt->params.n_arp_entries == 0)) {
-		uint64_t macaddr_src = MAC_SRC_DEFAULT;
+		uint64_t macaddr_src = p_rt->macaddr[req->data.port_id];
 		uint64_t macaddr_dst;
 		uint64_t ethertype_mpls = 0x8847;
 
@@ -1620,8 +1704,8 @@ pipeline_routing_msg_req_route_add_handler(struct pipeline *p, void *msg)
 			return rsp;
 		}
 
-		entry_arp0.slab[2] = rte_bswap64((macaddr_src << 16) |
-			ethertype_mpls);
+		entry_arp0.slab[2] =
+			SLAB_NBO_MACADDRSRC_ETHERTYPE(macaddr_src, ethertype_mpls);
 		entry_arp0.slab_offset[2] = p_rt->params.ip_hdr_offset -
 			(n_labels * 4 + 8);
 
@@ -1637,7 +1721,7 @@ pipeline_routing_msg_req_route_add_handler(struct pipeline *p, void *msg)
 	/* Ether MPLS - ARP on */
 	if ((p_rt->params.encap == PIPELINE_ROUTING_ENCAP_ETHERNET_MPLS) &&
 		p_rt->params.n_arp_entries) {
-		uint64_t macaddr_src = MAC_SRC_DEFAULT;
+		uint64_t macaddr_src = p_rt->macaddr[req->data.port_id];
 		uint64_t ethertype_mpls = 0x8847;
 
 		uint64_t label0 = req->data.l2.mpls.labels[0];
@@ -1702,8 +1786,8 @@ pipeline_routing_msg_req_route_add_handler(struct pipeline *p, void *msg)
 			return rsp;
 		}
 
-		entry_arp1.slab[2] = rte_bswap64((macaddr_src << 16) |
-			ethertype_mpls);
+		entry_arp1.slab[2] =
+			SLAB_NBO_MACADDRSRC_ETHERTYPE(macaddr_src, ethertype_mpls);
 		entry_arp1.slab_offset[2] = p_rt->params.ip_hdr_offset -
 			(n_labels * 4 + 8);
 
@@ -1884,10 +1968,25 @@ pipeline_routing_msg_req_arp_del_default_handler(struct pipeline *p, void *msg)
 	return rsp;
 }
 
+void *
+pipeline_routing_msg_req_set_macaddr_handler(struct pipeline *p, void *msg)
+{
+	struct pipeline_routing *p_rt = (struct pipeline_routing *) p;
+	struct pipeline_routing_set_macaddr_msg_req *req = msg;
+	struct pipeline_routing_set_macaddr_msg_rsp *rsp = msg;
+	uint32_t port_id;
+
+	for (port_id = 0; port_id < p->n_ports_out; port_id++)
+		p_rt->macaddr[port_id] = req->macaddr[port_id];
+
+	rsp->status = 0;
+
+	return rsp;
+}
+
 struct pipeline_be_ops pipeline_routing_be_ops = {
 	.f_init = pipeline_routing_init,
 	.f_free = pipeline_routing_free,
 	.f_run = NULL,
 	.f_timer = pipeline_routing_timer,
-	.f_track = pipeline_routing_track,
 };

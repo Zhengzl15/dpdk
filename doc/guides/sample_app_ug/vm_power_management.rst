@@ -72,7 +72,7 @@ The solution is comprised of two high-level components:
    the APCI cpufreq sysfs interface used on the host.
 
    The l3fwd-power application will use this implementation when deployed on a VM
-   (see Chapter 11 "L3 Forwarding with Power Management Application").
+   (see :doc:`l3_forward_power_man`).
 
 .. _figure_vm_power_mgr_highlevel:
 
@@ -167,7 +167,7 @@ Virtio-Serial channels are configured via libvirt XML:
   </controller>
   <channel type='unix'>
     <source mode='bind' path='/tmp/powermonitor/{vm_name}.{channel_num}'/>
-    <target type='virtio' name='virtio.serial.port.poweragent.{vm_channel_num}/>
+    <target type='virtio' name='virtio.serial.port.poweragent.{vm_channel_num}'/>
     <address type='virtio-serial' controller='0' bus='0' port='{N}'/>
   </channel>
 
@@ -314,7 +314,7 @@ Manual control and inspection can also be carried in relation CPU frequency scal
 Compiling and Running the Guest Applications
 --------------------------------------------
 
-For compiling and running l3fwd-power, see Chapter 11 "L3 Forwarding with Power Management Application".
+For compiling and running l3fwd-power, see :doc:`l3_forward_power_man`.
 
 A guest CLI is also provided for validating the setup.
 

@@ -38,8 +38,7 @@ Overview
 --------
 
 The application demonstrates the use of the hash and LPM libraries in the DPDK to implement packet forwarding.
-The initialization and run-time paths are very similar to those of the L2 forwarding application
-(see Chapter 9 "L2 Forwarding Sample Application (in Real and Virtualized Environments)" for more information).
+The initialization and run-time paths are very similar to those of the :doc:`l2_forward_real_virtual`.
 The main difference from the L2 Forwarding sample application is that the forwarding decision
 is made based on information read from the input packet.
 
@@ -89,30 +88,46 @@ To compile the application:
 Running the Application
 -----------------------
 
-The application has a number of command line options:
+The application has a number of command line options::
 
-.. code-block:: console
+    ./l3fwd [EAL options] -- -p PORTMASK
+                             [-P]
+                             [-E]
+                             [-L]
+                             --config(port,queue,lcore)[,(port,queue,lcore)]
+                             [--eth-dest=X,MM:MM:MM:MM:MM:MM]
+                             [--enable-jumbo [--max-pkt-len PKTLEN]]
+                             [--no-numa]
+                             [--hash-entry-num]
+                             [--ipv6]
+                             [--parse-ptype]
 
-    ./build/l3fwd [EAL options] -- -p PORTMASK [-P]  --config(port,queue,lcore)[,(port,queue,lcore)] [--enable-jumbo [--max-pkt-len PKTLEN]]  [--no-numa][--hash-entry-num][--ipv6]
+Where,
 
-where,
+* ``-p PORTMASK:`` Hexadecimal bitmask of ports to configure
 
-*   -p PORTMASK: Hexadecimal bitmask of ports to configure
+* ``-P:`` Optional, sets all ports to promiscuous mode so that packets are accepted regardless of the packet's Ethernet MAC destination address.
+  Without this option, only packets with the Ethernet MAC destination address set to the Ethernet address of the port are accepted.
 
-*   -P: optional, sets all ports to promiscuous mode so that packets are accepted regardless of the packet's Ethernet MAC destination address.
-    Without this option, only packets with the Ethernet MAC destination address set to the Ethernet address of the port are accepted.
+* ``-E:`` Optional, enable exact match.
 
-*   --config (port,queue,lcore)[,(port,queue,lcore)]: determines which queues from which ports are mapped to which cores
+* ``-L:`` Optional, enable longest prefix match.
 
-*   --enable-jumbo: optional, enables jumbo frames
+* ``--config (port,queue,lcore)[,(port,queue,lcore)]:`` Determines which queues from which ports are mapped to which cores.
 
-*   --max-pkt-len: optional, maximum packet length in decimal (64-9600)
+* ``--eth-dest=X,MM:MM:MM:MM:MM:MM:`` Optional, ethernet destination for port X.
 
-*   --no-numa: optional, disables numa awareness
+* ``--enable-jumbo:`` Optional, enables jumbo frames.
 
-*   --hash-entry-num: optional, specifies the hash entry number in hexadecimal to be setup
+* ``--max-pkt-len:`` Optional, under the premise of enabling jumbo, maximum packet length in decimal (64-9600).
 
-*   --ipv6: optional, set it if running ipv6 packets
+* ``--no-numa:`` Optional, disables numa awareness.
+
+* ``--hash-entry-num:`` Optional, specifies the hash entry number in hexadecimal to be setup.
+
+* ``--ipv6:`` Optional, set if running ipv6 packets.
+
+* ``--parse-ptype:`` Optional, set to use software to analyze packet type. Without this option, hardware will check the packet type.
 
 For example, consider a dual processor socket platform where cores 0-7 and 16-23 appear on socket 0, while cores 8-15 and 24-31 appear on socket 1.
 Let's say that the programmer wants to use memory from both NUMA nodes, the platform has only two ports, one connected to each NUMA node,
@@ -157,12 +172,13 @@ In this command:
 Refer to the *DPDK Getting Started Guide* for general information on running applications and
 the Environment Abstraction Layer (EAL) options.
 
+.. _l3_fwd_explanation:
+
 Explanation
 -----------
 
 The following sections provide some explanation of the sample application code. As mentioned in the overview section,
-the initialization and run-time paths are very similar to those of the L2 forwarding application
-(see Chapter 9 "L2 Forwarding Sample Application (in Real and Virtualized Environments)" for more information).
+the initialization and run-time paths are very similar to those of the :doc:`l2_forward_real_virtual`.
 The following sections describe aspects that are specific to the L3 Forwarding sample application.
 
 Hash Initialization
@@ -282,7 +298,7 @@ The get_ipv4_dst_port() function is shown below:
         int ret = 0;
         union ipv4_5tuple_host key;
 
-        ipv4_hdr = (uint8_t \*)ipv4_hdr + offsetof(struct ipv4_hdr, time_to_live);
+        ipv4_hdr = (uint8_t *)ipv4_hdr + offsetof(struct ipv4_hdr, time_to_live);
 
         m128i data = _mm_loadu_si128(( m128i*)(ipv4_hdr));
 
@@ -322,7 +338,7 @@ The key code snippet of simple_ipv4_fwd_4pkts() is shown below:
 
         const void *key_array[4] = {&key[0], &key[1], &key[2],&key[3]};
 
-        rte_hash_lookup_multi(qconf->ipv4_lookup_struct, &key_array[0], 4, ret);
+        rte_hash_lookup_bulk(qconf->ipv4_lookup_struct, &key_array[0], 4, ret);
 
         dst_port[0] = (ret[0] < 0)? portid:ipv4_l3fwd_out_if[ret[0]];
         dst_port[1] = (ret[1] < 0)? portid:ipv4_l3fwd_out_if[ret[1]];
@@ -333,6 +349,8 @@ The key code snippet of simple_ipv4_fwd_4pkts() is shown below:
     }
 
 The simple_ipv6_fwd_4pkts() function is similar to the simple_ipv4_fwd_4pkts() function.
+
+Known issue: IP packets with extensions or IP packets which are not TCP/UDP cannot work well at this mode.
 
 Packet Forwarding for LPM-based Lookups
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -31,6 +31,8 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <stdio.h>
+
 #include <rte_cycles.h>
 #include <rte_hash.h>
 #include <rte_hash_crc.h>
@@ -215,9 +217,4 @@ test_hash_scaling_main(void)
 	return r;
 }
 
-
-static struct test_command hash_scaling_cmd = {
-	.command = "hash_scaling_autotest",
-	.callback = test_hash_scaling_main,
-};
-REGISTER_TEST_COMMAND(hash_scaling_cmd);
+REGISTER_TEST_COMMAND(hash_scaling_autotest, test_hash_scaling_main);

@@ -39,7 +39,6 @@
 #include <sched.h>
 #include <dlfcn.h>
 
-#include <rte_config.h>
 #include <rte_log.h>
 
 #include "lthread_api.h"
@@ -418,9 +417,10 @@ int pthread_detach(pthread_t tid)
 	if (override) {
 		struct lthread *lt = (struct lthread *)tid;
 
-		if (lt == lthread_current())
+		if (lt == lthread_current()) {
 			lthread_detach();
 			return 0;
+		}
 		NOT_IMPLEMENTED;
 	}
 	return _sys_pthread_funcs.f_pthread_detach(tid);

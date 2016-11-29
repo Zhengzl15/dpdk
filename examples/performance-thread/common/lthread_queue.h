@@ -129,7 +129,7 @@ _lthread_queue_create(const char *name)
 
 	/* allocated stub node */
 	stub = _qnode_alloc();
-	LTHREAD_ASSERT(stub);
+	RTE_ASSERT(stub);
 
 	if (name != NULL)
 		strncpy(new_queue->name, name, sizeof(new_queue->name));
@@ -153,7 +153,7 @@ _lthread_queue_create(const char *name)
 static inline int __attribute__ ((always_inline))
 _lthread_queue_empty(struct lthread_queue *q)
 {
-	return (q->tail == q->head);
+	return q->tail == q->head;
 }
 
 

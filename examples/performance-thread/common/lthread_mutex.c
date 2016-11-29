@@ -44,7 +44,6 @@
 #include <sys/time.h>
 #include <sys/mman.h>
 
-#include <rte_config.h>
 #include <rte_per_lcore.h>
 #include <rte_log.h>
 #include <rte_spinlock.h>
@@ -171,7 +170,6 @@ int lthread_mutex_lock(struct lthread_mutex *m)
 		_suspend();
 		/* resumed, must loop and compete for the lock again */
 	}
-	LTHREAD_ASSERT(0);
 	return 0;
 }
 
@@ -232,7 +230,7 @@ int lthread_mutex_unlock(struct lthread_mutex *m)
 		if (unblocked != NULL) {
 			rte_atomic64_dec(&m->count);
 			DIAG_EVENT(m, LT_DIAG_MUTEX_UNLOCKED, m, unblocked);
-			LTHREAD_ASSERT(unblocked->sched != NULL);
+			RTE_ASSERT(unblocked->sched != NULL);
 			_ready_queue_insert((struct lthread_sched *)
 					    unblocked->sched, unblocked);
 			break;
